@@ -135,3 +135,58 @@ export function calculateStreak(completionDates: Date[], now = new Date()): numb
 
   return streak;
 }
+
+export const dailyChallenges = [
+  {
+    id: "incident-summary",
+    eyebrow: "Today’s IT-English challenge",
+    title: "Turn an incident into a calm update",
+    prompt: "Write two clear sentences explaining that the customer portal is unavailable, the team is investigating, and the next update will be shared in 30 minutes.",
+    note: "Use short sentences. Focus on impact, action, and timing.",
+  },
+  {
+    id: "standup-commitment",
+    eyebrow: "Today’s IT-English challenge",
+    title: "Give a confident stand-up update",
+    prompt: "Write a three-sentence stand-up update: what you finished, what you will do next, and one blocker you need help with.",
+    note: "Try: ‘Yesterday I… Today I will… I need help with…’",
+  },
+  {
+    id: "requirement-question",
+    eyebrow: "Today’s IT-English challenge",
+    title: "Ask one useful requirement question",
+    prompt: "Write two questions you would ask a stakeholder before building a reporting dashboard for their team.",
+    note: "Ask about the user, the decision they need to make, and the data they trust.",
+  },
+  {
+    id: "release-note",
+    eyebrow: "Today’s IT-English challenge",
+    title: "Write a concise release note",
+    prompt: "Write a short release note for a new password-reset flow that improves security and makes the process easier for users.",
+    note: "Name the change, explain the benefit, and keep the tone user-focused.",
+  },
+  {
+    id: "interview-example",
+    eyebrow: "Today’s IT-English challenge",
+    title: "Share an interview-ready example",
+    prompt: "In three sentences, describe a time you solved a technical or project problem. Focus on the situation, your action, and the result.",
+    note: "Use direct action verbs such as analysed, coordinated, improved, or delivered.",
+  },
+] as const;
+
+export function challengeDateKey(date = new Date()): string {
+  return date.toISOString().slice(0, 10);
+}
+
+export function getDailyChallenge(date = new Date()) {
+  const key = challengeDateKey(date);
+  const seed = Array.from(key).reduce((total, character) => total + character.charCodeAt(0), 0);
+  return { ...dailyChallenges[seed % dailyChallenges.length], date: key };
+}
+
+export const supportedAudioMimes = ["audio/webm", "audio/ogg", "audio/wav", "audio/mpeg", "audio/mp4"] as const;
+export type SupportedAudioMime = (typeof supportedAudioMimes)[number];
+
+export function isSupportedAudioMime(mimeType: string): mimeType is SupportedAudioMime {
+  return (supportedAudioMimes as readonly string[]).includes(mimeType);
+}

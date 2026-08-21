@@ -1,5 +1,6 @@
 import { useAuth } from "@/_core/hooks/useAuth";
 import { Button } from "@/components/ui/button";
+import { DailyChallengeCard } from "@/components/DailyChallengeCard";
 import { trpc } from "@/lib/trpc";
 import { ArrowRight, BookOpenCheck, BriefcaseBusiness, Flame, MessagesSquare, Sparkles, Target, TrendingUp } from "lucide-react";
 import { useLocation } from "wouter";
@@ -34,6 +35,8 @@ export default function Home() {
       <div className="study-card p-5"><div className="flex items-start justify-between"><div><p className="text-xs font-bold uppercase tracking-[0.14em] text-muted-foreground">Completed sessions</p><p className="mt-3 editorial-title text-4xl font-semibold">{data?.completedSessions ?? 0}</p></div><span className="rounded-xl bg-[#E4F0F4] p-2.5 text-[#34718A]"><TrendingUp className="size-5" /></span></div><p className="mt-4 text-xs text-muted-foreground">Practice and career role-plays count here.</p></div>
       <div className="study-card p-5"><div className="flex items-start justify-between"><div><p className="text-xs font-bold uppercase tracking-[0.14em] text-muted-foreground">Vocabulary learned</p><p className="mt-3 editorial-title text-4xl font-semibold">{data?.vocabularyLearned ?? 0}</p></div><span className="rounded-xl bg-[#E9EFE3] p-2.5 text-[#57744B]"><Sparkles className="size-5" /></span></div><p className="mt-4 text-xs text-muted-foreground">Earned through strong vocabulary practice.</p></div>
     </section>
+
+    <DailyChallengeCard />
 
     <section className="grid gap-6 xl:grid-cols-[1.55fr_0.9fr]">
       <div className="study-card p-5 sm:p-6"><div className="flex items-end justify-between"><div><p className="text-xs font-bold uppercase tracking-[0.14em] text-muted-foreground">Choose a focused moment</p><h2 className="editorial-title mt-2 text-3xl font-semibold">Your desk is ready.</h2></div></div><div className="mt-5 grid gap-3 md:grid-cols-3">{quickActions.map(action => { const Icon = action.icon; return <button key={action.title} onClick={() => setLocation(action.path)} className="group rounded-2xl border border-border/80 bg-background p-4 text-left hover:-translate-y-0.5 hover:shadow-md"><span className={`inline-flex rounded-xl p-2 ${action.tone}`}><Icon className="size-4" /></span><p className="mt-5 font-semibold">{action.title}</p><p className="mt-1 text-xs leading-5 text-muted-foreground">{action.copy}</p><ArrowRight className="mt-4 size-4 text-muted-foreground transition-transform group-hover:translate-x-1" /></button>; })}</div></div>

@@ -15,6 +15,13 @@
       "when": 1787285375893,
       "tag": "0001_certain_manta",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1787286252079,
+      "tag": "0002_wise_human_torch",
+      "breakpoints": true
     }
   ]
 }

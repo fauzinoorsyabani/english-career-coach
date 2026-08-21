@@ -3,10 +3,12 @@ import { z } from "zod";
 import { COOKIE_NAME } from "@shared/const";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { invokeLLM } from "./_core/llm";
+import { transcribeAudio } from "./_core/voiceTranscription";
 import { systemRouter } from "./_core/systemRouter";
 import { protectedProcedure, publicProcedure, router } from "./_core/trpc";
 import * as db from "./db";
-import { careerScenarios, parsePracticeFeedback, PracticeType, TUTOR_MODES, tutorModeLabels, tutorSystemPrompt } from "./learning";
+import { careerScenarios, challengeDateKey, getDailyChallenge, isSupportedAudioMime, parsePracticeFeedback, PracticeType, supportedAudioMimes, TUTOR_MODES, tutorModeLabels, tutorSystemPrompt } from "./learning";
+import { storageGetSignedUrl, storagePut } from "./storage";
 
 const tutorModeSchema = z.enum(TUTOR_MODES);
 const practiceTypeSchema = z.enum(["vocabulary", "grammar", "rewrite", "writing"] satisfies [PracticeType, ...PracticeType[]]);
@@ -110,6 +112,65 @@ export const appRouter = router({
       if (!conversation || conversation.conversation.scenarioSlug !== input.slug) throw new TRPCError({ code: "NOT_FOUND", message: "This guided scenario was not found." });
       await db.completeScenario(ctx.user.id, input.slug, input.conversationId);
       return { success: true };
+    }),
+  }),
+  flashcards: router({
+    list: protectedProcedure.query(({ ctx }) => db.listFlashcards(ctx.user.id)),
+    save: protectedProcedure.input(z.object({
+      term: z.string().trim().min(2).max(100),
+      definition: z.string().trim().max(500).optional(),
+      example: z.string().trim().max(500).optional(),
+      conversationId: z.string().min(8).max(24).optional(),
+    })).mutation(async ({ ctx, input }) => {
+      if (input.conversationId && !await db.getConversation(ctx.user.id, input.conversationId)) {
+        throw new TRPCError({ code: "NOT_FOUND", message: "This tutor conversation was not found." });
+      }
+      return db.saveFlashcard(ctx.user.id, {
+        term: input.term,
+        definition: input.definition || "Saved from your AI tutor feedback.",
+        example: input.example || "Review this term in a sentence from your own IT work.",
+        sourceConversationId: input.conversationId,
+      });
+    }),
+    markReviewed: protectedProcedure.input(z.object({ flashcardId: z.string().min(8).max(24) })).mutation(({ ctx, input }) => db.markFlashcardReviewed(ctx.user.id, input.flashcardId)),
+  }),
+  challenge: router({
+    get: protectedProcedure.query(async ({ ctx }) => {
+      const challenge = getDailyChallenge();
+      const completion = await db.getChallengeCompletion(ctx.user.id, challenge.date);
+      return { ...challenge, completed: Boolean(completion), response: completion?.response ?? null };
+    }),
+    complete: protectedProcedure.input(z.object({ response: cleanText })).mutation(async ({ ctx, input }) => {
+      const challenge = getDailyChallenge();
+      await db.completeDailyChallenge(ctx.user.id, { challengeDate: challenge.date, challengeId: challenge.id, response: input.response });
+      return { success: true, challengeDate: challenge.date };
+    }),
+  }),
+  voice: router({
+    transcribe: protectedProcedure.input(z.object({
+      conversationId: z.string().min(8).max(24),
+      audioBase64: z.string().min(32).max(7_000_000),
+      mimeType: z.enum(supportedAudioMimes),
+    })).mutation(async ({ ctx, input }) => {
+      const conversation = await db.getConversation(ctx.user.id, input.conversationId);
+      if (!conversation?.conversation.scenarioSlug) throw new TRPCError({ code: "BAD_REQUEST", message: "Voice input is available only inside a career role-play." });
+      if (!isSupportedAudioMime(input.mimeType)) throw new TRPCError({ code: "BAD_REQUEST", message: "This audio format is not supported." });
+      const audio = Buffer.from(input.audioBase64, "base64");
+      if (audio.length === 0 || audio.length > 5 * 1024 * 1024) throw new TRPCError({ code: "BAD_REQUEST", message: "Please record a response under 5 MB." });
+      const extension: Record<string, string> = { "audio/webm": "webm", "audio/ogg": "ogg", "audio/wav": "wav", "audio/mpeg": "mp3", "audio/mp4": "m4a" };
+      try {
+        const stored = await storagePut(`${ctx.user.id}/roleplay-audio/${input.conversationId}/response.${extension[input.mimeType]}`, audio, input.mimeType);
+        const audioUrl = await storageGetSignedUrl(stored.key);
+        const transcription = await transcribeAudio({ audioUrl, language: "en", prompt: "Transcribe a learner practising spoken English for an IT career role-play. Preserve technical terms and punctuation where possible." });
+        if ("error" in transcription) throw new TRPCError({ code: "BAD_REQUEST", message: transcription.error });
+        const text = transcription.text.trim();
+        if (!text) throw new TRPCError({ code: "BAD_REQUEST", message: "We could not hear a clear spoken response. Please try again in a quieter space." });
+        return { text, duration: transcription.duration, language: transcription.language };
+      } catch (error) {
+        if (error instanceof TRPCError) throw error;
+        console.error("[Voice transcription]", error);
+        throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Voice transcription is temporarily unavailable. Please try typing your response." });
+      }
     }),
   }),
   progress: router({ overview: protectedProcedure.query(({ ctx }) => db.getProgressOverview(ctx.user.id)) }),

@@ -30,4 +30,15 @@ describe("protected learning input validation", () => {
     const caller = appRouter.createCaller(createAuthenticatedContext());
     await expect(caller.profile.update({ englishLevel: "Intermediate", targetRole: "Systems Analyst", focusAreas: ["Workplace English"], dailyGoal: 0 })).rejects.toMatchObject({ code: "BAD_REQUEST" });
   });
+
+  it("rejects empty flashcard terms and an empty daily challenge response", async () => {
+    const caller = appRouter.createCaller(createAuthenticatedContext());
+    await expect(caller.flashcards.save({ term: "" })).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(caller.challenge.complete({ response: "" })).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+
+  it("rejects unsupported voice MIME input before transcription or storage work", async () => {
+    const caller = appRouter.createCaller(createAuthenticatedContext());
+    await expect(caller.voice.transcribe({ conversationId: "private-conversation", audioBase64: "a".repeat(64), mimeType: "video/mp4" as never })).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
 });

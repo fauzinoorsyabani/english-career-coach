@@ -97,9 +97,42 @@ export const scenarioCompletions = mysqlTable(
   table => ({ userScenario: uniqueIndex("completion_user_scenario_idx").on(table.userId, table.scenarioSlug) })
 );
 
+export const vocabularyFlashcards = mysqlTable(
+  "vocabulary_flashcards",
+  {
+    id: varchar("id", { length: 24 }).primaryKey(),
+    userId: int("userId").notNull(),
+    term: varchar("term", { length: 100 }).notNull(),
+    definition: text("definition").notNull(),
+    example: text("example").notNull(),
+    sourceConversationId: varchar("sourceConversationId", { length: 24 }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    reviewedAt: timestamp("reviewedAt"),
+  },
+  table => ({
+    userTerm: uniqueIndex("flashcard_user_term_idx").on(table.userId, table.term),
+    userCreated: index("flashcard_user_created_idx").on(table.userId, table.createdAt),
+  })
+);
+
+export const dailyChallengeCompletions = mysqlTable(
+  "daily_challenge_completions",
+  {
+    id: varchar("id", { length: 24 }).primaryKey(),
+    userId: int("userId").notNull(),
+    challengeDate: varchar("challengeDate", { length: 10 }).notNull(),
+    challengeId: varchar("challengeId", { length: 64 }).notNull(),
+    response: text("response").notNull(),
+    completedAt: timestamp("completedAt").defaultNow().notNull(),
+  },
+  table => ({ userDate: uniqueIndex("challenge_user_date_idx").on(table.userId, table.challengeDate) })
+);
+
 export type User = typeof users.$inferSelect;
 export type InsertUser = typeof users.$inferInsert;
 export type LearnerProfile = typeof learnerProfiles.$inferSelect;
 export type TutorConversation = typeof tutorConversations.$inferSelect;
 export type TutorMessage = typeof tutorMessages.$inferSelect;
 export type PracticeAttempt = typeof practiceAttempts.$inferSelect;
+export type VocabularyFlashcard = typeof vocabularyFlashcards.$inferSelect;
+export type DailyChallengeCompletion = typeof dailyChallengeCompletions.$inferSelect;

@@ -2,6 +2,7 @@ import { and, desc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import { nanoid } from "nanoid";
 import {
+  dailyChallengeCompletions,
   InsertUser,
   learnerProfiles,
   practiceAttempts,
@@ -9,6 +10,7 @@ import {
   tutorConversations,
   tutorMessages,
   users,
+  vocabularyFlashcards,
 } from "../drizzle/schema";
 import { calculateStreak, PracticeFeedback, PracticeType, TutorMode } from "./learning";
 import { ENV } from "./_core/env";
@@ -66,18 +68,13 @@ export async function getProfile(userId: number) {
   const db = await requireDb();
   const rows = await db.select().from(learnerProfiles).where(eq(learnerProfiles.userId, userId)).limit(1);
   if (rows[0]) return rows[0];
-  const profile = {
-    id: nanoid(), userId, englishLevel: "Intermediate", targetRole: "Information Systems Professional",
-    focusAreas: ["Workplace English", "IT Vocabulary"], dailyGoal: 1,
-  };
+  const profile = { id: nanoid(), userId, englishLevel: "Intermediate", targetRole: "Information Systems Professional", focusAreas: ["Workplace English", "IT Vocabulary"], dailyGoal: 1 };
   await db.insert(learnerProfiles).values(profile);
   const created = await db.select().from(learnerProfiles).where(eq(learnerProfiles.userId, userId)).limit(1);
   return created[0]!;
 }
 
-export async function updateProfile(userId: number, values: {
-  englishLevel: string; targetRole: string; focusAreas: string[]; dailyGoal: number;
-}) {
+export async function updateProfile(userId: number, values: { englishLevel: string; targetRole: string; focusAreas: string[]; dailyGoal: number }) {
   const db = await requireDb();
   await getProfile(userId);
   await db.update(learnerProfiles).set(values).where(eq(learnerProfiles.userId, userId));
@@ -110,14 +107,12 @@ export async function addMessage(userId: number, conversationId: string, role: "
   await db.update(tutorConversations).set({ updatedAt: new Date() }).where(and(eq(tutorConversations.id, conversationId), eq(tutorConversations.userId, userId)));
 }
 
-export async function savePracticeAttempt(userId: number, input: {
-  activityType: PracticeType; prompt: string; response: string; feedback: PracticeFeedback;
-}) {
+export async function savePracticeAttempt(userId: number, input: { activityType: PracticeType; prompt: string; response: string; feedback: PracticeFeedback }) {
   const db = await requireDb();
-  const attempt = { id: nanoid(), userId, activityType: input.activityType, prompt: input.prompt, response: input.response, score: input.feedback.score, feedback: {
-    correction: input.feedback.correction, explanation: input.feedback.explanation, naturalAlternative: input.feedback.naturalAlternative,
-    errorCategories: input.feedback.errorCategories, vocabulary: input.feedback.vocabulary,
-  } };
+  const attempt = {
+    id: nanoid(), userId, activityType: input.activityType, prompt: input.prompt, response: input.response, score: input.feedback.score,
+    feedback: { correction: input.feedback.correction, explanation: input.feedback.explanation, naturalAlternative: input.feedback.naturalAlternative, errorCategories: input.feedback.errorCategories, vocabulary: input.feedback.vocabulary },
+  };
   await db.insert(practiceAttempts).values(attempt);
   return attempt;
 }
@@ -129,24 +124,55 @@ export async function getScenarioCompletions(userId: number) {
 
 export async function completeScenario(userId: number, scenarioSlug: string, conversationId?: string) {
   const db = await requireDb();
-  await db.insert(scenarioCompletions).values({ id: nanoid(), userId, scenarioSlug, conversationId: conversationId ?? null, completedAt: new Date() })
-    .onDuplicateKeyUpdate({ set: { conversationId: conversationId ?? null, completedAt: new Date() } });
+  await db.insert(scenarioCompletions).values({ id: nanoid(), userId, scenarioSlug, conversationId: conversationId ?? null, completedAt: new Date() }).onDuplicateKeyUpdate({ set: { conversationId: conversationId ?? null, completedAt: new Date() } });
+}
+
+export async function listFlashcards(userId: number) {
+  const db = await requireDb();
+  return db.select().from(vocabularyFlashcards).where(eq(vocabularyFlashcards.userId, userId)).orderBy(desc(vocabularyFlashcards.createdAt));
+}
+
+export async function saveFlashcard(userId: number, input: { term: string; definition: string; example: string; sourceConversationId?: string }) {
+  const db = await requireDb();
+  await db.insert(vocabularyFlashcards).values({ id: nanoid(), userId, term: input.term, definition: input.definition, example: input.example, sourceConversationId: input.sourceConversationId ?? null }).onDuplicateKeyUpdate({ set: { definition: input.definition, example: input.example, sourceConversationId: input.sourceConversationId ?? null } });
+  const cards = await db.select().from(vocabularyFlashcards).where(and(eq(vocabularyFlashcards.userId, userId), eq(vocabularyFlashcards.term, input.term))).limit(1);
+  return cards[0]!;
+}
+
+export async function markFlashcardReviewed(userId: number, flashcardId: string) {
+  const db = await requireDb();
+  await db.update(vocabularyFlashcards).set({ reviewedAt: new Date() }).where(and(eq(vocabularyFlashcards.id, flashcardId), eq(vocabularyFlashcards.userId, userId)));
+}
+
+export async function getChallengeCompletion(userId: number, challengeDate: string) {
+  const db = await requireDb();
+  const rows = await db.select().from(dailyChallengeCompletions).where(and(eq(dailyChallengeCompletions.userId, userId), eq(dailyChallengeCompletions.challengeDate, challengeDate))).limit(1);
+  return rows[0];
+}
+
+export async function completeDailyChallenge(userId: number, input: { challengeDate: string; challengeId: string; response: string }) {
+  const db = await requireDb();
+  await db.insert(dailyChallengeCompletions).values({ id: nanoid(), userId, ...input, completedAt: new Date() }).onDuplicateKeyUpdate({ set: { challengeId: input.challengeId, response: input.response, completedAt: new Date() } });
+  return getChallengeCompletion(userId, input.challengeDate);
 }
 
 export async function getProgressOverview(userId: number) {
   const db = await requireDb();
-  const [profile, attempts, completions] = await Promise.all([
+  const [profile, attempts, completions, challenges, flashcards] = await Promise.all([
     getProfile(userId),
     db.select().from(practiceAttempts).where(eq(practiceAttempts.userId, userId)).orderBy(desc(practiceAttempts.completedAt)),
     db.select().from(scenarioCompletions).where(eq(scenarioCompletions.userId, userId)).orderBy(desc(scenarioCompletions.completedAt)),
+    db.select().from(dailyChallengeCompletions).where(eq(dailyChallengeCompletions.userId, userId)).orderBy(desc(dailyChallengeCompletions.completedAt)),
+    db.select().from(vocabularyFlashcards).where(eq(vocabularyFlashcards.userId, userId)),
   ]);
-  const activityDates = [...attempts.map(item => item.completedAt), ...completions.map(item => item.completedAt)];
+  const activityDates = [...attempts.map(item => item.completedAt), ...completions.map(item => item.completedAt), ...challenges.map(item => item.completedAt)];
   const errorMap = new Map<string, number>();
   attempts.forEach(item => item.feedback.errorCategories.forEach(category => errorMap.set(category, (errorMap.get(category) ?? 0) + 1)));
   const errorCategories = Array.from(errorMap.entries()).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value).slice(0, 5);
   const recentActivity = [
     ...attempts.map(item => ({ id: item.id, title: `${item.activityType[0].toUpperCase()}${item.activityType.slice(1)} practice completed`, date: item.completedAt, score: item.score, kind: "practice" as const })),
     ...completions.map(item => ({ id: item.id, title: "Career scenario completed", date: item.completedAt, score: null, kind: "career" as const })),
+    ...challenges.map(item => ({ id: item.id, title: "Daily IT-English challenge completed", date: item.completedAt, score: null, kind: "challenge" as const })),
   ].sort((a, b) => b.date.getTime() - a.date.getTime()).slice(0, 6);
   const today = new Date().toISOString().slice(0, 10);
   const todaySessions = activityDates.filter(date => date.toISOString().slice(0, 10) === today).length;
@@ -155,7 +181,8 @@ export async function getProgressOverview(userId: number) {
     todaySessions,
     streak: calculateStreak(activityDates),
     completedSessions: activityDates.length,
-    vocabularyLearned: attempts.filter(item => item.activityType === "vocabulary" && item.score >= 70).length * 5,
+    vocabularyLearned: Math.max(flashcards.length, attempts.filter(item => item.activityType === "vocabulary" && item.score >= 70).length * 5),
+    flashcardsCount: flashcards.length,
     errorCategories,
     recentActivity,
   };

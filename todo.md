@@ -14,4 +14,14 @@
 - [x] Implement progress calculations for streak, completed sessions, error categories, vocabulary learned, and recent activity.
 - [x] Add protected tests for data scoping, learner settings, progress calculations, chat input validation, and structured feedback parsing.
 - [x] Run type checking, unit tests, production build, desktop/mobile visual verification, and console-error review.
-- [ ] Save a release-ready checkpoint after every completed item is marked accurately.
+- [x] Save a release-ready checkpoint after every completed item is marked accurately.
+- [x] Add user-scoped vocabulary flashcard persistence, save actions from tutor feedback, and a dedicated flashcard review experience.
+- [x] Add voice recording and secure speech-to-text transcription for stand-up and interview role-play responses.
+- [x] Add a daily IT-English challenge with user-scoped completion tracking and streak integration.
+- [x] Add tests for vocabulary ownership, challenge completion idempotency, transcription validation, and updated streak calculations.
+- [x] Run type checking, unit tests, production build, desktop/mobile visual verification, and console-error review for the learning extensions.
+- [x] Attempt active career-scenario voice verification; the sandbox browser reached the learner Google sign-in boundary, while source validation and the browser-unsupported/error fallback were verified without recording any user audio.
+- [ ] Save a checkpoint for the verified learning extensions.
+- [ ] Create a public GitHub repository, commit the verified project source, and push the release branch.
+- [ ] Deploy the GitHub repository through Vercel and verify the released deployment URL and status.
+- [ ] Confirm the public GitHub repository and Vercel deployment contain every completed English Career Coach feature.

@@ -21,7 +21,7 @@
 - [x] Add tests for vocabulary ownership, challenge completion idempotency, transcription validation, and updated streak calculations.
 - [x] Run type checking, unit tests, production build, desktop/mobile visual verification, and console-error review for the learning extensions.
 - [x] Attempt active career-scenario voice verification; the sandbox browser reached the learner Google sign-in boundary, while source validation and the browser-unsupported/error fallback were verified without recording any user audio.
-- [ ] Save a checkpoint for the verified learning extensions.
+- [x] Save a checkpoint for the verified learning extensions.
 - [ ] Create a public GitHub repository, commit the verified project source, and push the release branch.
 - [ ] Deploy the GitHub repository through Vercel and verify the released deployment URL and status.
 - [ ] Confirm the public GitHub repository and Vercel deployment contain every completed English Career Coach feature.

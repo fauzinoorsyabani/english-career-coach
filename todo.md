@@ -26,4 +26,5 @@
 - [ ] Deploy the GitHub repository through Vercel and verify the released deployment URL and status.
 - [ ] Confirm the public GitHub repository and Vercel deployment contain every completed English Career Coach feature.
 - [ ] Correct the Vercel output routing so the public root serves the React application rather than the bundled server file.
+- [ ] Bundle the authenticated server runtime into the Vercel API function so protected and public tRPC routes start successfully.
 - [x] Document the external runtime environment required for authentication, database access, storage, AI tutoring, and voice transcription on Vercel.

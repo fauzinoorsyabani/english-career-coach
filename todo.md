@@ -28,7 +28,9 @@
 - [x] Correct the Vercel output routing so the public root serves the React application rather than the bundled server file.
 - [x] Bundle the authenticated server runtime into the Vercel API function so protected and public tRPC routes start successfully.
 - [x] Document the external runtime environment required for authentication, database access, storage, AI tutoring, and voice transcription on Vercel.
-- [ ] Add the required external runtime secrets and OAuth redirect authorization in Vercel to activate authenticated data, AI, storage, and voice features in production.
-- [ ] Redeploy after external configuration and validate an authenticated protected tRPC route in Vercel production.
-- [ ] Confirm the deployed Vercel app exposes the complete working feature set after production configuration, not only the public code and routes.
-- [ ] Save a checkpoint that includes the Vercel serverless release configuration.
+- [ ] Paused by user: add the required external runtime secrets and OAuth redirect authorization in Vercel to activate authenticated data, AI, storage, and voice features in production.
+- [ ] Paused by user: redeploy after external configuration and validate an authenticated protected tRPC route in Vercel production.
+- [ ] Paused by user: confirm the deployed Vercel app exposes the complete working feature set after production configuration, not only the public code and routes.
+- [x] Save a checkpoint that includes the Vercel serverless release configuration.
+- [x] Add an Antigravity IDE handoff guide covering local setup, database migrations, portable integrations, and paused Vercel activation.
+- [x] Verify the Antigravity IDE handoff guide contains the complete local setup, migration, integration-replacement, and paused-Vercel guidance.

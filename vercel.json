@@ -2,14 +2,19 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "buildCommand": "pnpm build",
   "outputDirectory": "dist/public",
-  "rewrites": [
+  "routes": [
     {
-      "source": "/manus-storage/:path*",
-      "destination": "/api/storage/:path*"
+      "src": "/api/(.*)",
+      "dest": "/api/[...path].ts"
     },
     {
-      "source": "/(.*)",
-      "destination": "/index.html"
+      "src": "/manus-storage/(.*)",
+      "dest": "/api/[...path].ts"
+    },
+    { "handle": "filesystem" },
+    {
+      "src": "/(.*)",
+      "dest": "/index.html"
     }
   ],
   "functions": {

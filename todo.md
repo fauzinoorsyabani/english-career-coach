@@ -23,8 +23,12 @@
 - [x] Attempt active career-scenario voice verification; the sandbox browser reached the learner Google sign-in boundary, while source validation and the browser-unsupported/error fallback were verified without recording any user audio.
 - [x] Save a checkpoint for the verified learning extensions.
 - [x] Create a public GitHub repository, commit the verified project source, and push the release branch.
-- [ ] Deploy the GitHub repository through Vercel and verify the released deployment URL and status.
-- [ ] Confirm the public GitHub repository and Vercel deployment contain every completed English Career Coach feature.
-- [ ] Correct the Vercel output routing so the public root serves the React application rather than the bundled server file.
-- [ ] Bundle the authenticated server runtime into the Vercel API function so protected and public tRPC routes start successfully.
+- [x] Deploy the GitHub repository through Vercel and verify the released deployment URL and status.
+- [x] Confirm the public GitHub repository and Vercel deployment contain every completed English Career Coach feature in the published codebase.
+- [x] Correct the Vercel output routing so the public root serves the React application rather than the bundled server file.
+- [x] Bundle the authenticated server runtime into the Vercel API function so protected and public tRPC routes start successfully.
 - [x] Document the external runtime environment required for authentication, database access, storage, AI tutoring, and voice transcription on Vercel.
+- [ ] Add the required external runtime secrets and OAuth redirect authorization in Vercel to activate authenticated data, AI, storage, and voice features in production.
+- [ ] Redeploy after external configuration and validate an authenticated protected tRPC route in Vercel production.
+- [ ] Confirm the deployed Vercel app exposes the complete working feature set after production configuration, not only the public code and routes.
+- [ ] Save a checkpoint that includes the Vercel serverless release configuration.

@@ -2,7 +2,7 @@ import { useAuth } from "@/_core/hooks/useAuth";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { startLogin } from "@/const";
-import { BarChart3, BookOpenCheck, BriefcaseBusiness, LogOut, MessageCircleHeart, Settings2, Sparkles } from "lucide-react";
+import { BarChart3, BookOpenCheck, BriefcaseBusiness, Loader2, LogOut, MessageCircleHeart, Settings2, Sparkles } from "lucide-react";
 import { useLocation } from "wouter";
 
 const navItems = [
@@ -18,7 +18,18 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   const [location, setLocation] = useLocation();
   const current = navItems.find(item => location.startsWith(item.path));
 
-  if (loading) return <div className="min-h-screen bg-background ink-grid" />;
+  if (loading) return (
+    <div className="min-h-screen bg-background ink-grid flex items-center justify-center p-5" role="status" aria-live="polite">
+      <section className="study-card w-full max-w-sm p-8 text-center">
+        <div className="mx-auto flex size-14 items-center justify-center rounded-2xl bg-primary text-primary-foreground"><Loader2 className="size-6 animate-spin" /></div>
+        <p className="mt-6 text-xs font-bold uppercase tracking-[0.18em] text-accent">English Career Coach</p>
+        <h1 className="editorial-title mt-2 text-3xl font-semibold">Opening your study lab.</h1>
+        <p className="mt-3 text-sm leading-6 text-muted-foreground">Preparing your personal English-learning workspace.</p>
+        <div className="mt-6 h-2 overflow-hidden rounded-full bg-muted"><div className="h-full w-2/3 animate-pulse rounded-full bg-accent" /></div>
+        <span className="sr-only">Loading your study workspace</span>
+      </section>
+    </div>
+  );
   if (!user) return (
     <div className="min-h-screen ink-grid flex items-center justify-center p-5">
       <section className="study-card w-full max-w-md p-8 text-center">

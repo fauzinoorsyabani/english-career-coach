@@ -34,3 +34,8 @@
 - [x] Save a checkpoint that includes the Vercel serverless release configuration.
 - [x] Add an Antigravity IDE handoff guide covering local setup, database migrations, portable integrations, and paused Vercel activation.
 - [x] Verify the Antigravity IDE handoff guide contains the complete local setup, migration, integration-replacement, and paused-Vercel guidance.
+- [x] Run AI-assisted QA across tutor, practice, career role-play, flashcards, daily challenge, progress, settings, mobile navigation, and error states.
+- [x] Record QA findings, distinguish verified behavior from paused production integrations, and apply safe fixes if defects are found.
+- [x] Replace the blank auth-loading screen with a branded, accessible loading fallback so protected routes never appear empty during session resolution.
+- [x] Verify the auth-loading fallback implementation in the layout source and through protected-route visual QA.
+- [x] Verify the saved QA report clearly separates validated local behavior from paused production integrations.

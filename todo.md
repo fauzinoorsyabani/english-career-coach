@@ -39,3 +39,8 @@
 - [x] Replace the blank auth-loading screen with a branded, accessible loading fallback so protected routes never appear empty during session resolution.
 - [x] Verify the auth-loading fallback implementation in the layout source and through protected-route visual QA.
 - [x] Verify the saved QA report clearly separates validated local behavior from paused production integrations.
+- [ ] Confirm the managed-publication readiness of the latest verified checkpoint and provide the required publish action to the user.
+- [ ] Create a free Aiven MySQL service for the English Career Coach and obtain its secure application connection details.
+- [ ] Apply the existing Drizzle learning-data migrations to the Aiven MySQL service.
+- [ ] Configure the Aiven `DATABASE_URL` in Vercel and validate the database-backed deployed route.
+- [ ] Push the latest QA report and protected-route loading fallback to the public GitHub repository and validate the refreshed Vercel deployment.

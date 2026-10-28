@@ -14,5 +14,11 @@ The public Vercel build serves the React client from `dist/public` and exposes t
 | `VITE_OAUTH_PORTAL_URL` | Client login portal URL. |
 | `VITE_FRONTEND_FORGE_API_URL` | Client Forge API base URL, if client-side Forge features are enabled. |
 | `VITE_FRONTEND_FORGE_API_KEY` | Client Forge token, if client-side Forge features are enabled. |
+| `LLM_API_URL` | Optional OpenAI-compatible base URL (for example `https://api.openai.com/v1`). Takes priority over Forge for chat and transcription. |
+| `LLM_API_KEY` | Optional OpenAI-compatible API key. When omitted, the server uses the offline rule-based coach. |
+| `LLM_MODEL` | Optional chat model name for the OpenAI-compatible provider. |
+| `TRANSCRIPTION_MODEL` | Optional transcription model name, default `whisper-1`. |
 
 Do not commit real values to GitHub. In Vercel, add values through **Project Settings → Environment Variables**, then redeploy `main`. The generated Vercel function intentionally reads these values only at runtime.
+
+Do **not** set `LOCAL_AUTH=true`, `LOCAL_DATA=true`, or `VITE_LOCAL_AUTH=true` in a production Vercel project. Those flags are for local demos only: they use a shared demo account and a non-durable JSON file. Production persistence requires `DATABASE_URL`, and production identity requires real OAuth configuration.

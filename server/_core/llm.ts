@@ -1,4 +1,6 @@
 import { ENV } from "./env";
+import { localPracticeFeedback, localTutorReply } from "../localCoach";
+import type { PracticeType } from "../learning";
 
 export type Role = "system" | "user" | "assistant" | "tool" | "function";
 
@@ -212,16 +214,82 @@ const normalizeToolChoice = (
   return toolChoice;
 };
 
-const resolveApiUrl = () =>
-  ENV.forgeApiUrl && ENV.forgeApiUrl.trim().length > 0
-    ? `${ENV.forgeApiUrl.replace(/\/$/, "")}/v1/chat/completions`
-    : "https://forge.manus.im/v1/chat/completions";
+const resolveProviderKey = () => ENV.llmApiKey || ENV.forgeApiKey;
+
+const resolveApiUrl = () => {
+  const base = ENV.llmApiUrl || ENV.forgeApiUrl;
+  if (!base) return "https://api.openai.com/v1/chat/completions";
+  const trimmed = base.replace(/\/+$/, "");
+  if (/\/chat\/completions$/.test(trimmed)) return trimmed;
+  if (/\/v1$/.test(trimmed)) return `${trimmed}/chat/completions`;
+  return `${trimmed}/v1/chat/completions`;
+};
 
 const assertApiKey = () => {
-  if (!ENV.forgeApiKey) {
-    throw new Error("OPENAI_API_KEY is not configured");
+  if (!resolveProviderKey()) {
+    throw new Error(
+      "No AI provider is configured. Set LLM_API_KEY/OPENAI_API_KEY or BUILT_IN_FORGE_API_KEY."
+    );
   }
 };
+
+const messageText = (message: Message): string => {
+  const parts = Array.isArray(message.content) ? message.content : [message.content];
+  return parts
+    .map(part => (typeof part === "string" ? part : part.type === "text" ? part.text : ""))
+    .join("\n")
+    .trim();
+};
+
+/**
+ * Offline rule-based coach used when no AI provider key is configured. It
+ * keeps every learning flow usable on a fresh clone without network access.
+ */
+function localInvoke(params: InvokeParams): InvokeResult {
+  const lastUser = [...params.messages].reverse().find(message => message.role === "user");
+  const text = lastUser ? messageText(lastUser) : "";
+  const responseFormat = params.response_format ?? params.responseFormat;
+  let content: string;
+
+  if (responseFormat?.type === "json_schema" && responseFormat.json_schema.name === "practice_feedback") {
+    const match = text.match(/Activity type:\s*(\w+)\s*\nPrompt:\s*([\s\S]*?)\nLearner response:\s*([\s\S]*)$/);
+    const activityType = (match?.[1] as PracticeType | undefined) ?? "writing";
+    content = JSON.stringify(
+      localPracticeFeedback({
+        activityType,
+        prompt: match?.[2]?.trim() ?? "",
+        response: match?.[3]?.trim() ?? text,
+      })
+    );
+  } else {
+    const systemPrompt = params.messages
+      .filter(message => message.role === "system")
+      .map(messageText)
+      .join("\n");
+    content = localTutorReply({
+      message: text,
+      systemPrompt,
+      history: params.messages.map(message => ({
+        role: message.role,
+        content: messageText(message),
+      })),
+    });
+  }
+
+  return {
+    id: `local-${Date.now()}`,
+    created: Math.floor(Date.now() / 1000),
+    model: "local-rule-based-coach",
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content },
+        finish_reason: "stop",
+      },
+    ],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  };
+}
 
 const normalizeResponseFormat = ({
   responseFormat,
@@ -340,7 +408,11 @@ const fetchWithBackoff = async (
 };
 
 export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
-  assertApiKey();
+  const apiKey = resolveProviderKey();
+  if (!apiKey) {
+    console.warn("[LLM] No AI provider configured; using the offline rule-based coach.");
+    return localInvoke(params);
+  }
 
   const {
     messages,
@@ -362,8 +434,9 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     messages: messages.map(normalizeMessage),
   };
 
-  if (model) {
-    payload.model = model;
+  const resolvedModel = ENV.llmModel || model;
+  if (resolvedModel) {
+    payload.model = resolvedModel;
   }
 
   if (tools && tools.length > 0) {
@@ -405,7 +478,7 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      authorization: `Bearer ${ENV.forgeApiKey}`,
+      authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify(payload),
   });

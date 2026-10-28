@@ -9,3 +9,11 @@ The final mobile review covered the dashboard, tutor, practice, career, progress
 The extension review confirmed that the daily IT-English challenge appears between dashboard metrics and quick actions, with a compact prompt, study note, response field, and completion action. The private flashcard deck has a clear empty state in the progress view and remains readable at the mobile breakpoint. The voice control is intentionally shown only after a learner begins a career role-play, preventing general chat recordings from being stored or transcribed as role-play responses.
 
 An active role-play microphone check was attempted through the sandbox browser. The protected preview redirected to the learner’s Google sign-in page before a scenario could be opened, so no personal account or microphone was used. Static validation, protected procedure tests, and the typed-response fallback were verified; the deployed role-play flow remains ready for an authenticated learner to grant microphone permission in their browser.
+
+## Local-first verification
+
+The self-contained demo mode was verified in a real headless Chrome session against the development server. Demo sign-in persisted a session cookie, the dashboard rendered “Welcome back, Alex,” and the Tutor, Practice, Career, Progress, and Settings routes all rendered without the error boundary. The browser console log contained no application errors or failed tRPC requests.
+
+The complete learning flow was also exercised through the API: profile update, tutor chat, practice submission with structured feedback, flashcard save/list, daily challenge completion, career scenario start/completion, and progress overview. The same flow was repeated against the production build served by `pnpm start`, confirming that the local JSON store, demo auth, and offline coach work in both development and production modes.
+
+Voice transcription remains provider-dependent. Without an AI/Forge key the UI returns a clear typed-response fallback; with an OpenAI-compatible key, stored audio is sent to the provider’s transcription endpoint.

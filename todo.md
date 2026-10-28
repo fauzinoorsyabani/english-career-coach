@@ -39,6 +39,12 @@
 - [x] Replace the blank auth-loading screen with a branded, accessible loading fallback so protected routes never appear empty during session resolution.
 - [x] Verify the auth-loading fallback implementation in the layout source and through protected-route visual QA.
 - [x] Verify the saved QA report clearly separates validated local behavior from paused production integrations.
+- [x] Add a self-contained local demo mode with demo sign-in, JSON persistence, and an offline rule-based tutor so the project runs without external credentials.
+- [x] Make the development and production scripts cross-platform and verify them on Windows.
+- [x] Run the full local flow end to end: sign-in, profile update, tutor chat, practice feedback, flashcards, career role-play, daily challenge, and progress.
+- [x] Add automated tests for the local store, owner scoping, challenge idempotency, and offline coach behavior.
+- [x] Add a project README and document optional OpenAI-compatible and MySQL configuration.
+- [ ] Configure a real AI provider for richer feedback (optional; the offline coach works without one).
 - [ ] Confirm the managed-publication readiness of the latest verified checkpoint and provide the required publish action to the user.
 - [ ] Create a free Aiven MySQL service for the English Career Coach and obtain its secure application connection details.
 - [ ] Apply the existing Drizzle learning-data migrations to the Aiven MySQL service.

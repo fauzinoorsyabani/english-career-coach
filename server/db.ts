@@ -12,10 +12,25 @@ import {
   users,
   vocabularyFlashcards,
 } from "../drizzle/schema";
-import { calculateStreak, PracticeFeedback, PracticeType, TutorMode } from "./learning";
+import { buildProgressOverview, PracticeFeedback, PracticeType, TutorMode } from "./learning";
 import { ENV } from "./_core/env";
+import * as localData from "./localData";
 
 let _db: ReturnType<typeof drizzle> | null = null;
+
+/**
+ * Local mode keeps the app fully usable without external credentials. It is
+ * enabled by `LOCAL_DATA=true`, or automatically outside production when no
+ * MySQL `DATABASE_URL` is configured. Vercel production still requires a real
+ * database, so a missing URL there fails loudly instead of silently writing to
+ * an ephemeral filesystem.
+ */
+function usesLocalData() {
+  return (
+    !process.env.DATABASE_URL &&
+    (process.env.LOCAL_DATA === "true" || process.env.NODE_ENV !== "production")
+  );
+}
 
 export async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
@@ -37,6 +52,10 @@ async function requireDb() {
 
 export async function upsertUser(user: InsertUser): Promise<void> {
   if (!user.openId) throw new Error("User openId is required for upsert");
+  if (usesLocalData()) {
+    localData.upsertUser(user);
+    return;
+  }
   const db = await getDb();
   if (!db) return;
   const values: InsertUser = { openId: user.openId, lastSignedIn: user.lastSignedIn ?? new Date() };
@@ -58,6 +77,7 @@ export async function upsertUser(user: InsertUser): Promise<void> {
 }
 
 export async function getUserByOpenId(openId: string) {
+  if (usesLocalData()) return localData.getUserByOpenId(openId);
   const db = await getDb();
   if (!db) return undefined;
   const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
@@ -65,6 +85,7 @@ export async function getUserByOpenId(openId: string) {
 }
 
 export async function getProfile(userId: number) {
+  if (usesLocalData()) return localData.getProfile(userId);
   const db = await requireDb();
   const rows = await db.select().from(learnerProfiles).where(eq(learnerProfiles.userId, userId)).limit(1);
   if (rows[0]) return rows[0];
@@ -75,6 +96,7 @@ export async function getProfile(userId: number) {
 }
 
 export async function updateProfile(userId: number, values: { englishLevel: string; targetRole: string; focusAreas: string[]; dailyGoal: number }) {
+  if (usesLocalData()) return localData.updateProfile(userId, values);
   const db = await requireDb();
   await getProfile(userId);
   await db.update(learnerProfiles).set(values).where(eq(learnerProfiles.userId, userId));
@@ -82,11 +104,13 @@ export async function updateProfile(userId: number, values: { englishLevel: stri
 }
 
 export async function listConversations(userId: number) {
+  if (usesLocalData()) return localData.listConversations(userId);
   const db = await requireDb();
   return db.select().from(tutorConversations).where(eq(tutorConversations.userId, userId)).orderBy(desc(tutorConversations.updatedAt)).limit(30);
 }
 
 export async function getConversation(userId: number, conversationId: string) {
+  if (usesLocalData()) return localData.getConversation(userId, conversationId);
   const db = await requireDb();
   const conversations = await db.select().from(tutorConversations).where(and(eq(tutorConversations.id, conversationId), eq(tutorConversations.userId, userId))).limit(1);
   if (!conversations[0]) return undefined;
@@ -95,6 +119,7 @@ export async function getConversation(userId: number, conversationId: string) {
 }
 
 export async function createConversation(userId: number, mode: TutorMode, title: string, scenarioSlug?: string) {
+  if (usesLocalData()) return localData.createConversation(userId, mode, title, scenarioSlug);
   const db = await requireDb();
   const conversation = { id: nanoid(), userId, mode, title, scenarioSlug: scenarioSlug ?? null };
   await db.insert(tutorConversations).values(conversation);
@@ -102,12 +127,14 @@ export async function createConversation(userId: number, mode: TutorMode, title:
 }
 
 export async function addMessage(userId: number, conversationId: string, role: "user" | "assistant", content: string) {
+  if (usesLocalData()) return localData.addMessage(userId, conversationId, role, content);
   const db = await requireDb();
   await db.insert(tutorMessages).values({ id: nanoid(), userId, conversationId, role, content });
   await db.update(tutorConversations).set({ updatedAt: new Date() }).where(and(eq(tutorConversations.id, conversationId), eq(tutorConversations.userId, userId)));
 }
 
 export async function savePracticeAttempt(userId: number, input: { activityType: PracticeType; prompt: string; response: string; feedback: PracticeFeedback }) {
+  if (usesLocalData()) return localData.savePracticeAttempt(userId, input);
   const db = await requireDb();
   const attempt = {
     id: nanoid(), userId, activityType: input.activityType, prompt: input.prompt, response: input.response, score: input.feedback.score,
@@ -118,21 +145,25 @@ export async function savePracticeAttempt(userId: number, input: { activityType:
 }
 
 export async function getScenarioCompletions(userId: number) {
+  if (usesLocalData()) return localData.getScenarioCompletions(userId);
   const db = await requireDb();
   return db.select().from(scenarioCompletions).where(eq(scenarioCompletions.userId, userId));
 }
 
 export async function completeScenario(userId: number, scenarioSlug: string, conversationId?: string) {
+  if (usesLocalData()) return localData.completeScenario(userId, scenarioSlug, conversationId);
   const db = await requireDb();
   await db.insert(scenarioCompletions).values({ id: nanoid(), userId, scenarioSlug, conversationId: conversationId ?? null, completedAt: new Date() }).onDuplicateKeyUpdate({ set: { conversationId: conversationId ?? null, completedAt: new Date() } });
 }
 
 export async function listFlashcards(userId: number) {
+  if (usesLocalData()) return localData.listFlashcards(userId);
   const db = await requireDb();
   return db.select().from(vocabularyFlashcards).where(eq(vocabularyFlashcards.userId, userId)).orderBy(desc(vocabularyFlashcards.createdAt));
 }
 
 export async function saveFlashcard(userId: number, input: { term: string; definition: string; example: string; sourceConversationId?: string }) {
+  if (usesLocalData()) return localData.saveFlashcard(userId, input);
   const db = await requireDb();
   await db.insert(vocabularyFlashcards).values({ id: nanoid(), userId, term: input.term, definition: input.definition, example: input.example, sourceConversationId: input.sourceConversationId ?? null }).onDuplicateKeyUpdate({ set: { definition: input.definition, example: input.example, sourceConversationId: input.sourceConversationId ?? null } });
   const cards = await db.select().from(vocabularyFlashcards).where(and(eq(vocabularyFlashcards.userId, userId), eq(vocabularyFlashcards.term, input.term))).limit(1);
@@ -140,23 +171,27 @@ export async function saveFlashcard(userId: number, input: { term: string; defin
 }
 
 export async function markFlashcardReviewed(userId: number, flashcardId: string) {
+  if (usesLocalData()) return localData.markFlashcardReviewed(userId, flashcardId);
   const db = await requireDb();
   await db.update(vocabularyFlashcards).set({ reviewedAt: new Date() }).where(and(eq(vocabularyFlashcards.id, flashcardId), eq(vocabularyFlashcards.userId, userId)));
 }
 
 export async function getChallengeCompletion(userId: number, challengeDate: string) {
+  if (usesLocalData()) return localData.getChallengeCompletion(userId, challengeDate);
   const db = await requireDb();
   const rows = await db.select().from(dailyChallengeCompletions).where(and(eq(dailyChallengeCompletions.userId, userId), eq(dailyChallengeCompletions.challengeDate, challengeDate))).limit(1);
   return rows[0];
 }
 
 export async function completeDailyChallenge(userId: number, input: { challengeDate: string; challengeId: string; response: string }) {
+  if (usesLocalData()) return localData.completeDailyChallenge(userId, input);
   const db = await requireDb();
   await db.insert(dailyChallengeCompletions).values({ id: nanoid(), userId, ...input, completedAt: new Date() }).onDuplicateKeyUpdate({ set: { challengeId: input.challengeId, response: input.response, completedAt: new Date() } });
   return getChallengeCompletion(userId, input.challengeDate);
 }
 
 export async function getProgressOverview(userId: number) {
+  if (usesLocalData()) return localData.getProgressOverview(userId);
   const db = await requireDb();
   const [profile, attempts, completions, challenges, flashcards] = await Promise.all([
     getProfile(userId),
@@ -165,25 +200,11 @@ export async function getProgressOverview(userId: number) {
     db.select().from(dailyChallengeCompletions).where(eq(dailyChallengeCompletions.userId, userId)).orderBy(desc(dailyChallengeCompletions.completedAt)),
     db.select().from(vocabularyFlashcards).where(eq(vocabularyFlashcards.userId, userId)),
   ]);
-  const activityDates = [...attempts.map(item => item.completedAt), ...completions.map(item => item.completedAt), ...challenges.map(item => item.completedAt)];
-  const errorMap = new Map<string, number>();
-  attempts.forEach(item => item.feedback.errorCategories.forEach(category => errorMap.set(category, (errorMap.get(category) ?? 0) + 1)));
-  const errorCategories = Array.from(errorMap.entries()).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value).slice(0, 5);
-  const recentActivity = [
-    ...attempts.map(item => ({ id: item.id, title: `${item.activityType[0].toUpperCase()}${item.activityType.slice(1)} practice completed`, date: item.completedAt, score: item.score, kind: "practice" as const })),
-    ...completions.map(item => ({ id: item.id, title: "Career scenario completed", date: item.completedAt, score: null, kind: "career" as const })),
-    ...challenges.map(item => ({ id: item.id, title: "Daily IT-English challenge completed", date: item.completedAt, score: null, kind: "challenge" as const })),
-  ].sort((a, b) => b.date.getTime() - a.date.getTime()).slice(0, 6);
-  const today = new Date().toISOString().slice(0, 10);
-  const todaySessions = activityDates.filter(date => date.toISOString().slice(0, 10) === today).length;
-  return {
+  return buildProgressOverview({
     dailyGoal: profile.dailyGoal,
-    todaySessions,
-    streak: calculateStreak(activityDates),
-    completedSessions: activityDates.length,
-    vocabularyLearned: Math.max(flashcards.length, attempts.filter(item => item.activityType === "vocabulary" && item.score >= 70).length * 5),
-    flashcardsCount: flashcards.length,
-    errorCategories,
-    recentActivity,
-  };
+    attempts,
+    completions,
+    challenges,
+    flashcards,
+  });
 }

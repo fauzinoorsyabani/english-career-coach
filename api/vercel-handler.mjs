@@ -9,10 +9,10 @@ var AXIOS_TIMEOUT_MS = 3e4;
 var UNAUTHED_ERR_MSG = "Please login (10001)";
 var NOT_ADMIN_ERR_MSG = "You do not have required permission (10002)";
 var OAUTH_STATE_COOKIE = "__Host-oauth_state";
-var decodeOAuthState = (state) => {
+var decodeOAuthState = (state2) => {
   let decoded;
   try {
-    decoded = atob(state);
+    decoded = atob(state2);
   } catch {
     return { redirectUri: "" };
   }
@@ -24,13 +24,10 @@ var decodeOAuthState = (state) => {
   return { redirectUri: decoded };
 };
 
-// server/_core/oauth.ts
-import { parse as parseCookieHeader2 } from "cookie";
-
 // server/db.ts
 import { and, desc, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
-import { nanoid } from "nanoid";
+import { nanoid as nanoid2 } from "nanoid";
 
 // drizzle/schema.ts
 import {
@@ -258,6 +255,59 @@ function calculateStreak(completionDates, now = /* @__PURE__ */ new Date()) {
   }
   return streak;
 }
+function buildProgressOverview(input) {
+  const { dailyGoal, attempts, completions, challenges, flashcards } = input;
+  const activityDates = [
+    ...attempts.map((item) => item.completedAt),
+    ...completions.map((item) => item.completedAt),
+    ...challenges.map((item) => item.completedAt)
+  ];
+  const errorMap = /* @__PURE__ */ new Map();
+  attempts.forEach(
+    (item) => item.feedback.errorCategories.forEach(
+      (category) => errorMap.set(category, (errorMap.get(category) ?? 0) + 1)
+    )
+  );
+  const errorCategories = Array.from(errorMap.entries()).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value).slice(0, 5);
+  const recentActivity = [
+    ...attempts.map((item) => ({
+      id: item.id,
+      title: `${item.activityType[0].toUpperCase()}${item.activityType.slice(1)} practice completed`,
+      date: item.completedAt,
+      score: item.score,
+      kind: "practice"
+    })),
+    ...completions.map((item) => ({
+      id: item.id,
+      title: "Career scenario completed",
+      date: item.completedAt,
+      score: null,
+      kind: "career"
+    })),
+    ...challenges.map((item) => ({
+      id: item.id,
+      title: "Daily IT-English challenge completed",
+      date: item.completedAt,
+      score: null,
+      kind: "challenge"
+    }))
+  ].sort((a, b) => b.date.getTime() - a.date.getTime()).slice(0, 6);
+  const today = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+  const todaySessions = activityDates.filter((date) => date.toISOString().slice(0, 10) === today).length;
+  return {
+    dailyGoal,
+    todaySessions,
+    streak: calculateStreak(activityDates),
+    completedSessions: activityDates.length,
+    vocabularyLearned: Math.max(
+      flashcards.length,
+      attempts.filter((item) => item.activityType === "vocabulary" && item.score >= 70).length * 5
+    ),
+    flashcardsCount: flashcards.length,
+    errorCategories,
+    recentActivity
+  };
+}
 var dailyChallenges = [
   {
     id: "incident-summary",
@@ -309,19 +359,359 @@ function isSupportedAudioMime(mimeType) {
 }
 
 // server/_core/env.ts
+var isProduction = process.env.NODE_ENV === "production";
+var localMode = process.env.LOCAL_AUTH === "true";
+var DEV_JWT_SECRET = "english-career-coach-local-development-secret";
+var cookieSecret = process.env.JWT_SECRET ?? (!isProduction || localMode ? DEV_JWT_SECRET : "");
+var localAuthEnabled = localMode || !isProduction && !process.env.OAUTH_SERVER_URL && !process.env.VITE_APP_ID;
+if (!process.env.JWT_SECRET && (!isProduction || localMode)) {
+  console.warn(
+    "[Config] JWT_SECRET is not set; using the local development secret. Do not use this in production."
+  );
+}
 var ENV = {
   appId: process.env.VITE_APP_ID ?? "",
-  cookieSecret: process.env.JWT_SECRET ?? "",
+  cookieSecret,
   databaseUrl: process.env.DATABASE_URL ?? "",
   oAuthServerUrl: process.env.OAUTH_SERVER_URL ?? "",
   ownerOpenId: process.env.OWNER_OPEN_ID ?? "",
-  isProduction: process.env.NODE_ENV === "production",
+  isProduction,
+  localAuthEnabled,
   forgeApiUrl: process.env.BUILT_IN_FORGE_API_URL ?? "",
-  forgeApiKey: process.env.BUILT_IN_FORGE_API_KEY ?? ""
+  forgeApiKey: process.env.BUILT_IN_FORGE_API_KEY ?? "",
+  // Optional OpenAI-compatible provider. When present, it takes priority over
+  // the managed Forge endpoint. This keeps the app portable.
+  llmApiUrl: process.env.LLM_API_URL ?? process.env.OPENAI_BASE_URL ?? "",
+  llmApiKey: process.env.LLM_API_KEY ?? process.env.OPENAI_API_KEY ?? "",
+  llmModel: process.env.LLM_MODEL ?? ""
 };
+
+// server/localData.ts
+import fs from "node:fs";
+import path from "node:path";
+import { nanoid } from "nanoid";
+var DEFAULT_FILE = path.resolve(process.cwd(), ".data", "local-db.json");
+var dataFile = () => process.env.LOCAL_DATA_FILE?.trim() || DEFAULT_FILE;
+var state = null;
+function emptyState() {
+  return {
+    version: 1,
+    nextUserId: 1,
+    users: [],
+    learnerProfiles: [],
+    tutorConversations: [],
+    tutorMessages: [],
+    practiceAttempts: [],
+    scenarioCompletions: [],
+    vocabularyFlashcards: [],
+    dailyChallengeCompletions: []
+  };
+}
+var asDate = (value) => value == null ? value : value instanceof Date ? value : new Date(value);
+function loadState() {
+  if (state) return state;
+  const file = dataFile();
+  try {
+    if (fs.existsSync(file)) {
+      const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+      state = {
+        ...emptyState(),
+        ...raw,
+        version: 1,
+        users: (raw.users ?? []).map((user) => ({
+          ...user,
+          createdAt: asDate(user.createdAt),
+          updatedAt: asDate(user.updatedAt),
+          lastSignedIn: asDate(user.lastSignedIn)
+        })),
+        learnerProfiles: (raw.learnerProfiles ?? []).map((profile) => ({
+          ...profile,
+          createdAt: asDate(profile.createdAt),
+          updatedAt: asDate(profile.updatedAt)
+        })),
+        tutorConversations: (raw.tutorConversations ?? []).map((conversation) => ({
+          ...conversation,
+          createdAt: asDate(conversation.createdAt),
+          updatedAt: asDate(conversation.updatedAt)
+        })),
+        tutorMessages: (raw.tutorMessages ?? []).map((message) => ({
+          ...message,
+          createdAt: asDate(message.createdAt)
+        })),
+        practiceAttempts: (raw.practiceAttempts ?? []).map((attempt) => ({
+          ...attempt,
+          completedAt: asDate(attempt.completedAt)
+        })),
+        scenarioCompletions: (raw.scenarioCompletions ?? []).map((completion) => ({
+          ...completion,
+          completedAt: asDate(completion.completedAt)
+        })),
+        vocabularyFlashcards: (raw.vocabularyFlashcards ?? []).map((card) => ({
+          ...card,
+          createdAt: asDate(card.createdAt),
+          reviewedAt: asDate(card.reviewedAt) ?? null
+        })),
+        dailyChallengeCompletions: (raw.dailyChallengeCompletions ?? []).map((completion) => ({
+          ...completion,
+          completedAt: asDate(completion.completedAt)
+        }))
+      };
+      return state;
+    }
+  } catch (error) {
+    console.warn("[LocalData] Could not read local database, starting fresh:", error);
+  }
+  state = emptyState();
+  return state;
+}
+function saveState() {
+  const current = loadState();
+  const file = dataFile();
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const temporary = `${file}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify(current, null, 2), "utf8");
+    fs.renameSync(temporary, file);
+  } catch (error) {
+    console.error("[LocalData] Failed to save local database:", error);
+  }
+}
+function upsertUser(user) {
+  if (!user.openId) throw new Error("User openId is required for upsert");
+  const current = loadState();
+  const now = /* @__PURE__ */ new Date();
+  const existing = current.users.find((item) => item.openId === user.openId);
+  if (existing) {
+    if (user.name !== void 0) existing.name = user.name ?? null;
+    if (user.email !== void 0) existing.email = user.email ?? null;
+    if (user.loginMethod !== void 0) existing.loginMethod = user.loginMethod ?? null;
+    if (user.role !== void 0) existing.role = user.role;
+    existing.lastSignedIn = user.lastSignedIn ?? now;
+    existing.updatedAt = now;
+    saveState();
+    return existing;
+  }
+  const created = {
+    id: current.nextUserId++,
+    openId: user.openId,
+    name: user.name ?? null,
+    email: user.email ?? null,
+    loginMethod: user.loginMethod ?? null,
+    role: user.role ?? "user",
+    createdAt: now,
+    updatedAt: now,
+    lastSignedIn: user.lastSignedIn ?? now
+  };
+  current.users.push(created);
+  saveState();
+  return created;
+}
+function getUserByOpenId(openId) {
+  return loadState().users.find((user) => user.openId === openId);
+}
+function getProfile(userId) {
+  const current = loadState();
+  const existing = current.learnerProfiles.find((profile2) => profile2.userId === userId);
+  if (existing) return existing;
+  const now = /* @__PURE__ */ new Date();
+  const profile = {
+    id: nanoid(),
+    userId,
+    englishLevel: "Intermediate",
+    targetRole: "Information Systems Professional",
+    focusAreas: ["Workplace English", "IT Vocabulary"],
+    dailyGoal: 1,
+    createdAt: now,
+    updatedAt: now
+  };
+  current.learnerProfiles.push(profile);
+  saveState();
+  return profile;
+}
+function updateProfile(userId, values) {
+  const current = loadState();
+  const profile = getProfile(userId);
+  Object.assign(profile, values, { updatedAt: /* @__PURE__ */ new Date() });
+  if (!current.learnerProfiles.includes(profile)) current.learnerProfiles.push(profile);
+  saveState();
+  return profile;
+}
+function listConversations(userId) {
+  return loadState().tutorConversations.filter((conversation) => conversation.userId === userId).sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime()).slice(0, 30);
+}
+function getConversation(userId, conversationId) {
+  const current = loadState();
+  const conversation = current.tutorConversations.find(
+    (item) => item.id === conversationId && item.userId === userId
+  );
+  if (!conversation) return void 0;
+  const messages = current.tutorMessages.filter((message) => message.conversationId === conversationId && message.userId === userId).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  return { conversation, messages };
+}
+function createConversation(userId, mode, title, scenarioSlug) {
+  const now = /* @__PURE__ */ new Date();
+  const conversation = {
+    id: nanoid(),
+    userId,
+    mode,
+    title,
+    scenarioSlug: scenarioSlug ?? null,
+    createdAt: now,
+    updatedAt: now
+  };
+  loadState().tutorConversations.push(conversation);
+  saveState();
+  return conversation;
+}
+function addMessage(userId, conversationId, role, content) {
+  const current = loadState();
+  const message = {
+    id: nanoid(),
+    conversationId,
+    userId,
+    role,
+    content,
+    createdAt: /* @__PURE__ */ new Date()
+  };
+  current.tutorMessages.push(message);
+  const conversation = current.tutorConversations.find(
+    (item) => item.id === conversationId && item.userId === userId
+  );
+  if (conversation) conversation.updatedAt = /* @__PURE__ */ new Date();
+  saveState();
+  return message;
+}
+function savePracticeAttempt(userId, input) {
+  const attempt = {
+    id: nanoid(),
+    userId,
+    activityType: input.activityType,
+    prompt: input.prompt,
+    response: input.response,
+    score: input.feedback.score,
+    feedback: {
+      correction: input.feedback.correction,
+      explanation: input.feedback.explanation,
+      naturalAlternative: input.feedback.naturalAlternative,
+      errorCategories: input.feedback.errorCategories,
+      vocabulary: input.feedback.vocabulary
+    },
+    completedAt: /* @__PURE__ */ new Date()
+  };
+  loadState().practiceAttempts.push(attempt);
+  saveState();
+  return attempt;
+}
+function getScenarioCompletions(userId) {
+  return loadState().scenarioCompletions.filter((completion) => completion.userId === userId);
+}
+function completeScenario(userId, scenarioSlug, conversationId) {
+  const current = loadState();
+  const now = /* @__PURE__ */ new Date();
+  const existing = current.scenarioCompletions.find(
+    (completion2) => completion2.userId === userId && completion2.scenarioSlug === scenarioSlug
+  );
+  if (existing) {
+    existing.conversationId = conversationId ?? null;
+    existing.completedAt = now;
+    saveState();
+    return existing;
+  }
+  const completion = {
+    id: nanoid(),
+    userId,
+    scenarioSlug,
+    conversationId: conversationId ?? null,
+    completedAt: now
+  };
+  current.scenarioCompletions.push(completion);
+  saveState();
+  return completion;
+}
+function listFlashcards(userId) {
+  return loadState().vocabularyFlashcards.filter((card) => card.userId === userId).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+}
+function saveFlashcard(userId, input) {
+  const current = loadState();
+  const normalised = input.term.trim().toLowerCase();
+  const existing = current.vocabularyFlashcards.find(
+    (card2) => card2.userId === userId && card2.term.trim().toLowerCase() === normalised
+  );
+  if (existing) {
+    existing.definition = input.definition;
+    existing.example = input.example;
+    existing.sourceConversationId = input.sourceConversationId ?? null;
+    saveState();
+    return existing;
+  }
+  const card = {
+    id: nanoid(),
+    userId,
+    term: input.term,
+    definition: input.definition,
+    example: input.example,
+    sourceConversationId: input.sourceConversationId ?? null,
+    createdAt: /* @__PURE__ */ new Date(),
+    reviewedAt: null
+  };
+  current.vocabularyFlashcards.push(card);
+  saveState();
+  return card;
+}
+function markFlashcardReviewed(userId, flashcardId) {
+  const card = loadState().vocabularyFlashcards.find(
+    (item) => item.id === flashcardId && item.userId === userId
+  );
+  if (!card) return;
+  card.reviewedAt = /* @__PURE__ */ new Date();
+  saveState();
+}
+function getChallengeCompletion(userId, challengeDate) {
+  return loadState().dailyChallengeCompletions.find(
+    (completion) => completion.userId === userId && completion.challengeDate === challengeDate
+  );
+}
+function completeDailyChallenge(userId, input) {
+  const current = loadState();
+  const existing = current.dailyChallengeCompletions.find(
+    (completion2) => completion2.userId === userId && completion2.challengeDate === input.challengeDate
+  );
+  if (existing) {
+    existing.challengeId = input.challengeId;
+    existing.response = input.response;
+    existing.completedAt = /* @__PURE__ */ new Date();
+    saveState();
+    return existing;
+  }
+  const completion = {
+    id: nanoid(),
+    userId,
+    challengeDate: input.challengeDate,
+    challengeId: input.challengeId,
+    response: input.response,
+    completedAt: /* @__PURE__ */ new Date()
+  };
+  current.dailyChallengeCompletions.push(completion);
+  saveState();
+  return completion;
+}
+function getProgressOverview(userId) {
+  const current = loadState();
+  const profile = getProfile(userId);
+  return buildProgressOverview({
+    dailyGoal: profile.dailyGoal,
+    attempts: current.practiceAttempts.filter((attempt) => attempt.userId === userId),
+    completions: current.scenarioCompletions.filter((completion) => completion.userId === userId),
+    challenges: current.dailyChallengeCompletions.filter((completion) => completion.userId === userId),
+    flashcards: current.vocabularyFlashcards.filter((card) => card.userId === userId)
+  });
+}
 
 // server/db.ts
 var _db = null;
+function usesLocalData() {
+  return !process.env.DATABASE_URL && (process.env.LOCAL_DATA === "true" || process.env.NODE_ENV !== "production");
+}
 async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
     try {
@@ -338,8 +728,12 @@ async function requireDb() {
   if (!db) throw new Error("Database is unavailable");
   return db;
 }
-async function upsertUser(user) {
+async function upsertUser2(user) {
   if (!user.openId) throw new Error("User openId is required for upsert");
+  if (usesLocalData()) {
+    upsertUser(user);
+    return;
+  }
   const db = await getDb();
   if (!db) return;
   const values = { openId: user.openId, lastSignedIn: user.lastSignedIn ?? /* @__PURE__ */ new Date() };
@@ -359,53 +753,61 @@ async function upsertUser(user) {
   }
   await db.insert(users).values(values).onDuplicateKeyUpdate({ set: updateSet });
 }
-async function getUserByOpenId(openId) {
+async function getUserByOpenId2(openId) {
+  if (usesLocalData()) return getUserByOpenId(openId);
   const db = await getDb();
   if (!db) return void 0;
   const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
   return result[0];
 }
-async function getProfile(userId) {
+async function getProfile2(userId) {
+  if (usesLocalData()) return getProfile(userId);
   const db = await requireDb();
   const rows = await db.select().from(learnerProfiles).where(eq(learnerProfiles.userId, userId)).limit(1);
   if (rows[0]) return rows[0];
-  const profile = { id: nanoid(), userId, englishLevel: "Intermediate", targetRole: "Information Systems Professional", focusAreas: ["Workplace English", "IT Vocabulary"], dailyGoal: 1 };
+  const profile = { id: nanoid2(), userId, englishLevel: "Intermediate", targetRole: "Information Systems Professional", focusAreas: ["Workplace English", "IT Vocabulary"], dailyGoal: 1 };
   await db.insert(learnerProfiles).values(profile);
   const created = await db.select().from(learnerProfiles).where(eq(learnerProfiles.userId, userId)).limit(1);
   return created[0];
 }
-async function updateProfile(userId, values) {
+async function updateProfile2(userId, values) {
+  if (usesLocalData()) return updateProfile(userId, values);
   const db = await requireDb();
-  await getProfile(userId);
+  await getProfile2(userId);
   await db.update(learnerProfiles).set(values).where(eq(learnerProfiles.userId, userId));
-  return getProfile(userId);
+  return getProfile2(userId);
 }
-async function listConversations(userId) {
+async function listConversations2(userId) {
+  if (usesLocalData()) return listConversations(userId);
   const db = await requireDb();
   return db.select().from(tutorConversations).where(eq(tutorConversations.userId, userId)).orderBy(desc(tutorConversations.updatedAt)).limit(30);
 }
-async function getConversation(userId, conversationId) {
+async function getConversation2(userId, conversationId) {
+  if (usesLocalData()) return getConversation(userId, conversationId);
   const db = await requireDb();
   const conversations = await db.select().from(tutorConversations).where(and(eq(tutorConversations.id, conversationId), eq(tutorConversations.userId, userId))).limit(1);
   if (!conversations[0]) return void 0;
   const messages = await db.select().from(tutorMessages).where(and(eq(tutorMessages.conversationId, conversationId), eq(tutorMessages.userId, userId))).orderBy(tutorMessages.createdAt);
   return { conversation: conversations[0], messages };
 }
-async function createConversation(userId, mode, title, scenarioSlug) {
+async function createConversation2(userId, mode, title, scenarioSlug) {
+  if (usesLocalData()) return createConversation(userId, mode, title, scenarioSlug);
   const db = await requireDb();
-  const conversation = { id: nanoid(), userId, mode, title, scenarioSlug: scenarioSlug ?? null };
+  const conversation = { id: nanoid2(), userId, mode, title, scenarioSlug: scenarioSlug ?? null };
   await db.insert(tutorConversations).values(conversation);
   return conversation;
 }
-async function addMessage(userId, conversationId, role, content) {
+async function addMessage2(userId, conversationId, role, content) {
+  if (usesLocalData()) return addMessage(userId, conversationId, role, content);
   const db = await requireDb();
-  await db.insert(tutorMessages).values({ id: nanoid(), userId, conversationId, role, content });
+  await db.insert(tutorMessages).values({ id: nanoid2(), userId, conversationId, role, content });
   await db.update(tutorConversations).set({ updatedAt: /* @__PURE__ */ new Date() }).where(and(eq(tutorConversations.id, conversationId), eq(tutorConversations.userId, userId)));
 }
-async function savePracticeAttempt(userId, input) {
+async function savePracticeAttempt2(userId, input) {
+  if (usesLocalData()) return savePracticeAttempt(userId, input);
   const db = await requireDb();
   const attempt = {
-    id: nanoid(),
+    id: nanoid2(),
     userId,
     activityType: input.activityType,
     prompt: input.prompt,
@@ -416,68 +818,62 @@ async function savePracticeAttempt(userId, input) {
   await db.insert(practiceAttempts).values(attempt);
   return attempt;
 }
-async function getScenarioCompletions(userId) {
+async function getScenarioCompletions2(userId) {
+  if (usesLocalData()) return getScenarioCompletions(userId);
   const db = await requireDb();
   return db.select().from(scenarioCompletions).where(eq(scenarioCompletions.userId, userId));
 }
-async function completeScenario(userId, scenarioSlug, conversationId) {
+async function completeScenario2(userId, scenarioSlug, conversationId) {
+  if (usesLocalData()) return completeScenario(userId, scenarioSlug, conversationId);
   const db = await requireDb();
-  await db.insert(scenarioCompletions).values({ id: nanoid(), userId, scenarioSlug, conversationId: conversationId ?? null, completedAt: /* @__PURE__ */ new Date() }).onDuplicateKeyUpdate({ set: { conversationId: conversationId ?? null, completedAt: /* @__PURE__ */ new Date() } });
+  await db.insert(scenarioCompletions).values({ id: nanoid2(), userId, scenarioSlug, conversationId: conversationId ?? null, completedAt: /* @__PURE__ */ new Date() }).onDuplicateKeyUpdate({ set: { conversationId: conversationId ?? null, completedAt: /* @__PURE__ */ new Date() } });
 }
-async function listFlashcards(userId) {
+async function listFlashcards2(userId) {
+  if (usesLocalData()) return listFlashcards(userId);
   const db = await requireDb();
   return db.select().from(vocabularyFlashcards).where(eq(vocabularyFlashcards.userId, userId)).orderBy(desc(vocabularyFlashcards.createdAt));
 }
-async function saveFlashcard(userId, input) {
+async function saveFlashcard2(userId, input) {
+  if (usesLocalData()) return saveFlashcard(userId, input);
   const db = await requireDb();
-  await db.insert(vocabularyFlashcards).values({ id: nanoid(), userId, term: input.term, definition: input.definition, example: input.example, sourceConversationId: input.sourceConversationId ?? null }).onDuplicateKeyUpdate({ set: { definition: input.definition, example: input.example, sourceConversationId: input.sourceConversationId ?? null } });
+  await db.insert(vocabularyFlashcards).values({ id: nanoid2(), userId, term: input.term, definition: input.definition, example: input.example, sourceConversationId: input.sourceConversationId ?? null }).onDuplicateKeyUpdate({ set: { definition: input.definition, example: input.example, sourceConversationId: input.sourceConversationId ?? null } });
   const cards = await db.select().from(vocabularyFlashcards).where(and(eq(vocabularyFlashcards.userId, userId), eq(vocabularyFlashcards.term, input.term))).limit(1);
   return cards[0];
 }
-async function markFlashcardReviewed(userId, flashcardId) {
+async function markFlashcardReviewed2(userId, flashcardId) {
+  if (usesLocalData()) return markFlashcardReviewed(userId, flashcardId);
   const db = await requireDb();
   await db.update(vocabularyFlashcards).set({ reviewedAt: /* @__PURE__ */ new Date() }).where(and(eq(vocabularyFlashcards.id, flashcardId), eq(vocabularyFlashcards.userId, userId)));
 }
-async function getChallengeCompletion(userId, challengeDate) {
+async function getChallengeCompletion2(userId, challengeDate) {
+  if (usesLocalData()) return getChallengeCompletion(userId, challengeDate);
   const db = await requireDb();
   const rows = await db.select().from(dailyChallengeCompletions).where(and(eq(dailyChallengeCompletions.userId, userId), eq(dailyChallengeCompletions.challengeDate, challengeDate))).limit(1);
   return rows[0];
 }
-async function completeDailyChallenge(userId, input) {
+async function completeDailyChallenge2(userId, input) {
+  if (usesLocalData()) return completeDailyChallenge(userId, input);
   const db = await requireDb();
-  await db.insert(dailyChallengeCompletions).values({ id: nanoid(), userId, ...input, completedAt: /* @__PURE__ */ new Date() }).onDuplicateKeyUpdate({ set: { challengeId: input.challengeId, response: input.response, completedAt: /* @__PURE__ */ new Date() } });
-  return getChallengeCompletion(userId, input.challengeDate);
+  await db.insert(dailyChallengeCompletions).values({ id: nanoid2(), userId, ...input, completedAt: /* @__PURE__ */ new Date() }).onDuplicateKeyUpdate({ set: { challengeId: input.challengeId, response: input.response, completedAt: /* @__PURE__ */ new Date() } });
+  return getChallengeCompletion2(userId, input.challengeDate);
 }
-async function getProgressOverview(userId) {
+async function getProgressOverview2(userId) {
+  if (usesLocalData()) return getProgressOverview(userId);
   const db = await requireDb();
   const [profile, attempts, completions, challenges, flashcards] = await Promise.all([
-    getProfile(userId),
+    getProfile2(userId),
     db.select().from(practiceAttempts).where(eq(practiceAttempts.userId, userId)).orderBy(desc(practiceAttempts.completedAt)),
     db.select().from(scenarioCompletions).where(eq(scenarioCompletions.userId, userId)).orderBy(desc(scenarioCompletions.completedAt)),
     db.select().from(dailyChallengeCompletions).where(eq(dailyChallengeCompletions.userId, userId)).orderBy(desc(dailyChallengeCompletions.completedAt)),
     db.select().from(vocabularyFlashcards).where(eq(vocabularyFlashcards.userId, userId))
   ]);
-  const activityDates = [...attempts.map((item) => item.completedAt), ...completions.map((item) => item.completedAt), ...challenges.map((item) => item.completedAt)];
-  const errorMap = /* @__PURE__ */ new Map();
-  attempts.forEach((item) => item.feedback.errorCategories.forEach((category) => errorMap.set(category, (errorMap.get(category) ?? 0) + 1)));
-  const errorCategories = Array.from(errorMap.entries()).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value).slice(0, 5);
-  const recentActivity = [
-    ...attempts.map((item) => ({ id: item.id, title: `${item.activityType[0].toUpperCase()}${item.activityType.slice(1)} practice completed`, date: item.completedAt, score: item.score, kind: "practice" })),
-    ...completions.map((item) => ({ id: item.id, title: "Career scenario completed", date: item.completedAt, score: null, kind: "career" })),
-    ...challenges.map((item) => ({ id: item.id, title: "Daily IT-English challenge completed", date: item.completedAt, score: null, kind: "challenge" }))
-  ].sort((a, b) => b.date.getTime() - a.date.getTime()).slice(0, 6);
-  const today = (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
-  const todaySessions = activityDates.filter((date) => date.toISOString().slice(0, 10) === today).length;
-  return {
+  return buildProgressOverview({
     dailyGoal: profile.dailyGoal,
-    todaySessions,
-    streak: calculateStreak(activityDates),
-    completedSessions: activityDates.length,
-    vocabularyLearned: Math.max(flashcards.length, attempts.filter((item) => item.activityType === "vocabulary" && item.score >= 70).length * 5),
-    flashcardsCount: flashcards.length,
-    errorCategories,
-    recentActivity
-  };
+    attempts,
+    completions,
+    challenges,
+    flashcards
+  });
 }
 
 // server/_core/cookies.ts
@@ -489,11 +885,14 @@ function isSecureRequest(req) {
   return protoList.some((proto) => proto.trim().toLowerCase() === "https");
 }
 function getSessionCookieOptions(req) {
+  const secure = isSecureRequest(req);
   return {
     httpOnly: true,
     path: "/",
-    sameSite: "none",
-    secure: isSecureRequest(req)
+    // SameSite=None requires a Secure cookie. Local HTTP development uses Lax
+    // so the browser keeps the session.
+    sameSite: secure ? "none" : "lax",
+    secure
   };
 }
 
@@ -518,6 +917,10 @@ var GET_USER_INFO_WITH_JWT_PATH = `/webdev.v1.WebDevAuthPublicService/GetUserInf
 var OAuthService = class {
   constructor(client) {
     this.client = client;
+    if (ENV.localAuthEnabled) {
+      console.log("[Auth] Local demo sign-in is enabled.");
+      return;
+    }
     console.log("[OAuth] Initialized with baseURL:", ENV.oAuthServerUrl);
     if (!ENV.oAuthServerUrl) {
       console.error(
@@ -525,15 +928,15 @@ var OAuthService = class {
       );
     }
   }
-  decodeState(state) {
-    return decodeOAuthState(state).redirectUri;
+  decodeState(state2) {
+    return decodeOAuthState(state2).redirectUri;
   }
-  async getTokenByCode(code, state) {
+  async getTokenByCode(code, state2) {
     const payload = {
       clientId: ENV.appId,
       grantType: "authorization_code",
       code,
-      redirectUri: this.decodeState(state)
+      redirectUri: this.decodeState(state2)
     };
     const { data } = await this.client.post(
       EXCHANGE_TOKEN_PATH,
@@ -582,8 +985,8 @@ var SDKServer = class {
    * @example
    * const tokenResponse = await sdk.exchangeCodeForToken(code, state);
    */
-  async exchangeCodeForToken(code, state) {
-    return this.oauthService.getTokenByCode(code, state);
+  async exchangeCodeForToken(code, state2) {
+    return this.oauthService.getTokenByCode(code, state2);
   }
   /**
    * Get user information using access token
@@ -624,7 +1027,9 @@ var SDKServer = class {
     return this.signSession(
       {
         openId,
-        appId: ENV.appId,
+        // Local demo sessions do not have a Manus app id, but the token still
+        // needs a non-empty appId to pass verification.
+        appId: ENV.appId || "local-demo",
         name: options.name || ""
       },
       options
@@ -708,18 +1113,18 @@ var SDKServer = class {
     }
     const sessionUserId = session.openId;
     const signedInAt = /* @__PURE__ */ new Date();
-    let user = await getUserByOpenId(sessionUserId);
+    let user = await getUserByOpenId2(sessionUserId);
     if (!user) {
       try {
         const userInfo = await this.getUserInfoWithJwt(sessionToken ?? "");
-        await upsertUser({
+        await upsertUser2({
           openId: userInfo.openId,
           name: userInfo.name || null,
           email: userInfo.email ?? null,
           loginMethod: userInfo.loginMethod ?? userInfo.platform ?? null,
           lastSignedIn: signedInAt
         });
-        user = await getUserByOpenId(userInfo.openId);
+        user = await getUserByOpenId2(userInfo.openId);
       } catch (error) {
         console.error("[Auth] Failed to sync user from OAuth:", error);
         throw ForbiddenError("Failed to sync user info");
@@ -728,7 +1133,7 @@ var SDKServer = class {
     if (!user) {
       throw ForbiddenError("User not found");
     }
-    await upsertUser({
+    await upsertUser2({
       openId: user.openId,
       lastSignedIn: signedInAt
     });
@@ -754,7 +1159,51 @@ function buildCronUser(userInfo) {
 }
 var sdk = new SDKServer();
 
+// server/_core/localAuth.ts
+var LOCAL_DEMO_OPEN_ID = "local-demo-user";
+function isLocalAuthEnabled() {
+  return ENV.localAuthEnabled;
+}
+function safeReturnTo(value) {
+  if (typeof value !== "string") return "/";
+  if (!value.startsWith("/") || value.startsWith("//")) return "/";
+  return value;
+}
+function registerLocalAuthRoutes(app) {
+  app.get("/api/auth/local", async (req, res) => {
+    if (!isLocalAuthEnabled()) {
+      res.status(404).json({
+        error: "Local sign-in is disabled. Set LOCAL_AUTH=true for local development or configure OAuth."
+      });
+      return;
+    }
+    try {
+      await upsertUser2({
+        openId: LOCAL_DEMO_OPEN_ID,
+        name: "Alex Morgan",
+        email: "alex.morgan@example.com",
+        loginMethod: "local",
+        lastSignedIn: /* @__PURE__ */ new Date()
+      });
+      const user = await getUserByOpenId2(LOCAL_DEMO_OPEN_ID);
+      const sessionToken = await sdk.createSessionToken(LOCAL_DEMO_OPEN_ID, {
+        name: user?.name || "Alex Morgan",
+        expiresInMs: ONE_YEAR_MS
+      });
+      res.cookie(COOKIE_NAME, sessionToken, {
+        ...getSessionCookieOptions(req),
+        maxAge: ONE_YEAR_MS
+      });
+      res.redirect(302, safeReturnTo(req.query.returnTo));
+    } catch (error) {
+      console.error("[LocalAuth] Sign-in failed", error);
+      res.status(500).json({ error: "Local sign-in failed" });
+    }
+  });
+}
+
 // server/_core/oauth.ts
+import { parse as parseCookieHeader2 } from "cookie";
 function getQueryParam(req, key) {
   const value = req.query[key];
   return typeof value === "string" ? value : void 0;
@@ -762,12 +1211,12 @@ function getQueryParam(req, key) {
 function registerOAuthRoutes(app) {
   app.get("/api/oauth/callback", async (req, res) => {
     const code = getQueryParam(req, "code");
-    const state = getQueryParam(req, "state");
-    if (!code || !state) {
+    const state2 = getQueryParam(req, "state");
+    if (!code || !state2) {
       res.status(400).json({ error: "code and state are required" });
       return;
     }
-    const { nonce } = decodeOAuthState(state);
+    const { nonce } = decodeOAuthState(state2);
     const expectedNonce = parseCookieHeader2(req.headers.cookie ?? "")[OAUTH_STATE_COOKIE];
     if (!nonce || nonce !== expectedNonce) {
       res.status(403).json({ error: "invalid oauth state" });
@@ -775,13 +1224,13 @@ function registerOAuthRoutes(app) {
     }
     res.clearCookie(OAUTH_STATE_COOKIE, { path: "/", secure: true, sameSite: "none" });
     try {
-      const tokenResponse = await sdk.exchangeCodeForToken(code, state);
+      const tokenResponse = await sdk.exchangeCodeForToken(code, state2);
       const userInfo = await sdk.getUserInfo(tokenResponse.accessToken);
       if (!userInfo.openId) {
         res.status(400).json({ error: "openId missing from user info" });
         return;
       }
-      await upsertUser({
+      await upsertUser2({
         openId: userInfo.openId,
         name: userInfo.name || null,
         email: userInfo.email ?? null,
@@ -803,6 +1252,9 @@ function registerOAuthRoutes(app) {
 }
 
 // server/_core/storageProxy.ts
+import fs2 from "node:fs";
+import path2 from "node:path";
+var LOCAL_STORAGE_DIR = path2.resolve(process.cwd(), ".data", "storage");
 function registerStorageProxy(app) {
   app.get("/manus-storage/*", async (req, res) => {
     const key = req.params[0];
@@ -811,7 +1263,13 @@ function registerStorageProxy(app) {
       return;
     }
     if (!ENV.forgeApiUrl || !ENV.forgeApiKey) {
-      res.status(500).send("Storage proxy not configured");
+      const safeKey = key.replace(/\.\.(\/|\\|$)/g, "");
+      const file = path2.join(LOCAL_STORAGE_DIR, safeKey);
+      if (fs2.existsSync(file) && file.startsWith(LOCAL_STORAGE_DIR)) {
+        res.sendFile(file);
+        return;
+      }
+      res.status(404).send("Storage file not found");
       return;
     }
     try {
@@ -846,6 +1304,222 @@ function registerStorageProxy(app) {
 // server/routers.ts
 import { TRPCError as TRPCError3 } from "@trpc/server";
 import { z as z2 } from "zod";
+
+// server/localCoach.ts
+var corrections = [
+  { pattern: /\bI am agree\b/gi, replacement: "I agree", category: "Grammar", note: "\u201CAgree\u201D is a verb, so it does not need \u201Cam\u201D." },
+  { pattern: /\bI am not agree\b/gi, replacement: "I don't agree", category: "Grammar", note: "Use \u201CI don't agree\u201D or \u201CI disagree\u201D." },
+  { pattern: /\bwe are agree\b/gi, replacement: "we agree", category: "Grammar", note: "\u201CAgree\u201D is a verb, so it does not need \u201Care\u201D." },
+  { pattern: /\bdiscuss about\b/gi, replacement: "discuss", category: "Prepositions", note: "We discuss something; \u201Cabout\u201D is not needed after \u201Cdiscuss\u201D." },
+  { pattern: /\binformations\b/gi, replacement: "information", category: "Word choice", note: "\u201CInformation\u201D is uncountable, so it has no plural form." },
+  { pattern: /\badvices\b/gi, replacement: "advice", category: "Word choice", note: "\u201CAdvice\u201D is uncountable. Use \u201Ca piece of advice\u201D for one item." },
+  { pattern: /\bpeoples\b/gi, replacement: "people", category: "Word choice", note: "\u201CPeople\u201D is already plural." },
+  { pattern: /\bmore better\b/gi, replacement: "better", category: "Grammar", note: "\u201CBetter\u201D is already comparative, so \u201Cmore\u201D is unnecessary." },
+  { pattern: /\bcan able to\b/gi, replacement: "can", category: "Grammar", note: "Use either \u201Ccan\u201D or \u201Cbe able to\u201D, not both." },
+  { pattern: /\bI will can\b/gi, replacement: "I will be able to", category: "Grammar", note: "After \u201Cwill\u201D, use \u201Cbe able to\u201D rather than \u201Ccan\u201D." },
+  { pattern: /\b(want|need|hope|plan|try|decide) (improve|go|learn|start|work|become|do|make|ask|know|build|move|change|join|speak|write|read|finish|send|talk|study|practice)\b/gi, replacement: "$1 to $2", category: "Grammar", note: "Use \u201Cto\u201D before the verb after words such as \u201Cwant\u201D, \u201Cneed\u201D, or \u201Cplan\u201D." },
+  { pattern: /\bwe was\b/gi, replacement: "we were", category: "Verb tense", note: "\u201CWe\u201D takes \u201Cwere\u201D in the past tense." },
+  { pattern: /\bthey was\b/gi, replacement: "they were", category: "Verb tense", note: "\u201CThey\u201D takes \u201Cwere\u201D in the past tense." },
+  { pattern: /\bI didn't went\b/gi, replacement: "I didn't go", category: "Verb tense", note: "After \u201Cdidn't\u201D, use the base form of the verb." },
+  { pattern: /\bI didn't found\b/gi, replacement: "I didn't find", category: "Verb tense", note: "After \u201Cdidn't\u201D, use the base form of the verb." },
+  { pattern: /\bI have did\b/gi, replacement: "I have done", category: "Verb tense", note: "Use the past participle \u201Cdone\u201D after \u201Chave\u201D." },
+  { pattern: /\bI have went\b/gi, replacement: "I have gone", category: "Verb tense", note: "Use the past participle \u201Cgone\u201D after \u201Chave\u201D." },
+  { pattern: /\bI has\b/gi, replacement: "I have", category: "Grammar", note: "Use \u201Chave\u201D with \u201CI\u201D." },
+  { pattern: /\b(he|she|it) don't\b/gi, replacement: "$1 doesn't", category: "Grammar", note: "Use \u201Cdoesn't\u201D with he, she, or it." },
+  { pattern: /\bthere is many\b/gi, replacement: "there are many", category: "Grammar", note: "Use \u201Cthere are\u201D with a plural noun." },
+  { pattern: /\bpeople is\b/gi, replacement: "people are", category: "Grammar", note: "\u201CPeople\u201D is plural, so it takes \u201Care\u201D." },
+  { pattern: /\bone of my colleague\b/gi, replacement: "one of my colleagues", category: "Grammar", note: "Use the plural noun after \u201Cone of my\u201D." },
+  { pattern: /\bI have (\d+) years? experience\b/gi, replacement: "I have $1 years of experience", category: "Prepositions", note: "Use \u201Cyears of experience\u201D." },
+  { pattern: /\bI am working (here|on this) since\b/gi, replacement: "I have been working $1 since", category: "Verb tense", note: "Use the present perfect continuous for an action that started in the past and continues now." },
+  { pattern: /\bI'm working (here|on this) since\b/gi, replacement: "I have been working $1 since", category: "Verb tense", note: "Use the present perfect continuous for an action that started in the past and continues now." },
+  { pattern: /\bI have been working here from\b/gi, replacement: "I have been working here since", category: "Prepositions", note: "Use \u201Csince\u201D with a starting point in time." },
+  { pattern: /\bI'm interested about\b/gi, replacement: "I'm interested in", category: "Prepositions", note: "The adjective \u201Cinterested\u201D is followed by \u201Cin\u201D." },
+  { pattern: /\bI am interested to\b/gi, replacement: "I am interested in", category: "Prepositions", note: "Use \u201Cinterested in\u201D before a noun or -ing form." },
+  { pattern: /\bgood in\b/gi, replacement: "good at", category: "Prepositions", note: "Use \u201Cgood at\u201D for skills." },
+  { pattern: /\bresponsible of\b/gi, replacement: "responsible for", category: "Prepositions", note: "Use \u201Cresponsible for\u201D." },
+  { pattern: /\bparticipate to\b/gi, replacement: "participate in", category: "Prepositions", note: "Use \u201Cparticipate in\u201D." },
+  { pattern: /\bfocus in\b/gi, replacement: "focus on", category: "Prepositions", note: "Use \u201Cfocus on\u201D." },
+  { pattern: /\bexplain me\b/gi, replacement: "explain to me", category: "Grammar", note: "We explain something to someone." },
+  { pattern: /\bvery much good\b/gi, replacement: "very good", category: "Grammar", note: "Use \u201Cvery good\u201D or \u201Creally good\u201D." },
+  { pattern: /\bhow to say\b/gi, replacement: "how do you say", category: "Grammar", note: "Use \u201CHow do you say\u2026?\u201D for a direct question." },
+  { pattern: /\bIn my opinion, I think\b/gi, replacement: "In my opinion", category: "Clarity", note: "Choose one opinion phrase to avoid repetition." },
+  { pattern: /\bin the same time\b/gi, replacement: "at the same time", category: "Prepositions", note: "Use \u201Cat the same time\u201D." },
+  { pattern: /\bas per my opinion\b/gi, replacement: "in my opinion", category: "Clarity", note: "Use \u201Cin my opinion\u201D." },
+  { pattern: /\bme and my team\b/gi, replacement: "my team and I", category: "Grammar", note: "Put yourself second and use \u201CI\u201D as the subject." },
+  { pattern: /\bI have a doubt\b/gi, replacement: "I have a question", category: "Word choice", note: "In workplace English, \u201CI have a question\u201D is the natural phrase." },
+  { pattern: /\bdo the needful\b/gi, replacement: "take the necessary action", category: "Professional tone", note: "\u201CDo the needful\u201D is dated; use a specific action instead." },
+  { pattern: /\brevert back\b/gi, replacement: "reply", category: "Professional tone", note: "Use \u201Creply\u201D or \u201Cget back to you\u201D." },
+  { pattern: /\bprepone\b/gi, replacement: "bring forward", category: "Word choice", note: "Use \u201Cbring forward\u201D or \u201Cmove earlier\u201D." },
+  { pattern: /\bkindly\b/gi, replacement: "please", category: "Professional tone", note: "\u201CPlease\u201D is simpler and more natural in most workplace writing." }
+];
+var vocabularyIdeas = [
+  { word: "stakeholder", definition: "a person who has an interest in a project or decision", example: "I will share the timeline with the key stakeholders." },
+  { word: "blocker", definition: "a problem that prevents progress", example: "My only blocker is access to the test environment." },
+  { word: "root cause", definition: "the underlying reason a problem happened", example: "We found the root cause of the login failure." },
+  { word: "rollback", definition: "returning a system to a previous working version", example: "We performed a rollback after the release." },
+  { word: "deployment", definition: "the process of releasing software to an environment", example: "The deployment is scheduled for Thursday evening." },
+  { word: "mitigation", definition: "an action that reduces the impact of a problem", example: "Our mitigation reduced the impact on customers." },
+  { word: "requirement", definition: "something the product must do to meet a business need", example: "We clarified the reporting requirement with the user." },
+  { word: "deadline", definition: "the latest time by which work must be finished", example: "We can meet the deadline if testing finishes today." },
+  { word: "incident", definition: "an unplanned event that disrupts a service", example: "The incident affected the customer portal for 20 minutes." },
+  { word: "alignment", definition: "shared agreement between people or teams", example: "We need alignment on the scope before we start." },
+  { word: "ETA", definition: "estimated time of arrival or completion", example: "The ETA for the fix is 30 minutes." },
+  { word: "cross-functional", definition: "involving people from different teams or specialties", example: "A cross-functional team investigated the issue." },
+  { word: "dashboard", definition: "a screen that summarises important information", example: "The dashboard shows weekly support volumes." },
+  { word: "API", definition: "a defined way for two software systems to communicate", example: "The mobile app calls the payment API." },
+  { word: "database", definition: "an organised store of data that applications can query", example: "The customer records are stored in a database." },
+  { word: "cache", definition: "a temporary store that speeds up repeated access to data", example: "We cleared the cache after the update." },
+  { word: "firewall", definition: "a security control that filters network traffic", example: "The firewall blocks unexpected inbound connections." },
+  { word: "repository", definition: "a central place where code and its history are stored", example: "I pushed the fix to the repository." },
+  { word: "bug", definition: "a defect in software that causes incorrect behaviour", example: "We found a bug in the password-reset flow." },
+  { word: "scope", definition: "the agreed boundary of what a project will deliver", example: "That request is outside the scope of this release." }
+];
+function capitaliseFirst(text2) {
+  const trimmed = text2.trim();
+  if (!trimmed) return trimmed;
+  return `${trimmed[0].toUpperCase()}${trimmed.slice(1)}`;
+}
+function hasSentenceEnding(text2) {
+  return /[.!?]$/.test(text2.trim());
+}
+function finishSentence(text2) {
+  const trimmed = text2.trim();
+  if (!trimmed) return trimmed;
+  return hasSentenceEnding(trimmed) ? trimmed : `${trimmed}.`;
+}
+function generalAlternative(text2) {
+  const clean = normaliseText(text2).replace(/[.!?]+$/, "");
+  if (/^help me\b/i.test(clean)) {
+    return finishSentence(clean.replace(/^help me\b/i, "Could you help me"));
+  }
+  if (/^i want\b/i.test(clean)) {
+    return finishSentence(clean.replace(/^i want\b/i, "I'd like"));
+  }
+  if (/^i need\b/i.test(clean)) {
+    return finishSentence(clean.replace(/^i need\b/i, "I need"));
+  }
+  return finishSentence(clean);
+}
+function normaliseText(text2) {
+  return text2.replace(/\s+/g, " ").trim();
+}
+function correctEnglish(value) {
+  let text2 = normaliseText(value);
+  const notes = [];
+  for (const correction of corrections) {
+    correction.pattern.lastIndex = 0;
+    if (correction.pattern.test(text2)) {
+      text2 = text2.replace(correction.pattern, correction.replacement);
+      if (!notes.some((item) => item.note === correction.note)) {
+        notes.push({ category: correction.category, note: correction.note });
+      }
+    }
+  }
+  const capitalised = capitaliseFirst(text2);
+  if (capitalised !== text2) {
+    notes.push({ category: "Capitalisation", note: "Start a sentence with a capital letter." });
+  }
+  text2 = capitalised;
+  if (text2.length > 12 && !hasSentenceEnding(text2)) {
+    text2 = `${text2}.`;
+    notes.push({ category: "Punctuation", note: "Finish a complete sentence with a full stop." });
+  }
+  return { corrected: text2, notes };
+}
+function pickVocabulary(text2, limit = 3) {
+  const lower = text2.toLowerCase();
+  const words = vocabularyIdeas.filter((item) => lower.includes(item.word.toLowerCase()));
+  if (words.length > 0) return words.slice(0, limit).map((item) => item.word);
+  return vocabularyIdeas.slice(0, limit).map((item) => item.word);
+}
+function activityLabel(activityType) {
+  return {
+    vocabulary: "vocabulary",
+    grammar: "grammar correction",
+    rewrite: "sentence rewriting",
+    writing: "writing"
+  }[activityType];
+}
+function localPracticeFeedback(input) {
+  const { corrected, notes } = correctEnglish(input.response);
+  const wordCount = input.response.trim().split(/\s+/).filter(Boolean).length;
+  const categories = Array.from(new Set(notes.map((note) => note.category)));
+  let score = 90 - notes.length * 5;
+  if (wordCount < 6) {
+    score -= 12;
+    categories.push("Development");
+  } else if (wordCount > 35) {
+    score -= 3;
+  }
+  if (input.activityType === "vocabulary") score += 2;
+  if (input.activityType === "writing" && !/[.!?]/.test(input.response)) score -= 4;
+  score = Math.max(42, Math.min(97, Math.round(score)));
+  const strengths = notes.length === 0 ? "Your sentence is clear and easy to follow." : `Your meaning comes across, and the ${activityLabel(input.activityType)} exercise is a useful step.`;
+  const explanation = notes.length === 0 ? `${strengths} Keep the sentence specific, and add one concrete detail from your IT work when you can.` : `${strengths} ${notes.map((note) => note.note).join(" ")}`;
+  const vocabulary = pickVocabulary(input.response);
+  const naturalAlternative = input.activityType === "writing" ? `${finishSentence(corrected)} This version keeps your point direct, professional, and easy for a busy colleague to scan.` : input.activityType === "rewrite" ? `${finishSentence(corrected)} A more polished way to say it is to lead with the key point and then add the reason.` : input.activityType === "vocabulary" ? `${finishSentence(corrected)} A natural way to use this in your IT work is: \u201C${vocabularyIdeas.find((item) => item.word === vocabulary[0])?.example ?? "I used this term in a project update."}\u201D` : `${finishSentence(corrected)} A natural alternative is: \u201C${generalAlternative(input.response)}\u201D`;
+  return {
+    score,
+    correction: corrected || input.response,
+    explanation,
+    naturalAlternative,
+    errorCategories: Array.from(new Set(categories)),
+    vocabulary
+  };
+}
+function modeFromPrompt(systemPrompt) {
+  if (/supportive IT interviewer/i.test(systemPrompt)) return "interview";
+  if (/concise, professional workplace/i.test(systemPrompt)) return "workplace";
+  if (/accurate, accessible IT vocabulary/i.test(systemPrompt)) return "it_vocabulary";
+  return "general";
+}
+function vocabularyExplanation(message) {
+  const lower = message.toLowerCase();
+  const match = vocabularyIdeas.find((item) => lower.includes(item.word.toLowerCase()));
+  if (!match) {
+    return "A useful pattern for explaining an IT term is: \u201CIt is a ___ that helps people ___. For example, ___.\u201D This keeps the definition concrete for a non-technical listener.";
+  }
+  return `\u201C${match.word}\u201D means ${match.definition}. For example: \u201C${match.example}\u201D`;
+}
+function localTutorReply(input) {
+  const message = normaliseText(input.message);
+  const mode = modeFromPrompt(input.systemPrompt ?? "");
+  const { corrected, notes } = correctEnglish(message);
+  const correction = notes.length === 0 ? "Your English is already clear. I would keep it as it is." : `${corrected}`;
+  const why = notes.length === 0 ? "The sentence has a clear main idea and correct basic structure." : notes.map((note) => note.note).join(" ");
+  let answer;
+  let natural;
+  let next;
+  if (mode === "interview") {
+    answer = "Thank you \u2014 that gives me a useful starting point. A strong interview answer usually follows Situation \u2192 Action \u2192 Result, so make the result explicit.";
+    natural = `${finishSentence(corrected)} In an interview, you could add: \u201CThe result was ___, and it helped the team ___.\u201D`;
+    next = "Try answering this follow-up: \u201CWhat was the hardest part of that project, and how did you handle it?\u201D";
+  } else if (mode === "workplace") {
+    answer = "Here is a professional way to frame that for a colleague or stakeholder. Lead with the status, then the impact, then the next action.";
+    natural = `Status: ${finishSentence(corrected)} Next step: I will share an update by the end of the day.`;
+    next = "Rewrite it as a two-sentence update: one sentence for status and one for the next action or blocker.";
+  } else if (mode === "it_vocabulary") {
+    answer = vocabularyExplanation(message);
+    natural = `A natural explanation is: ${finishSentence(corrected)}`;
+    next = "Now explain the same idea to a non-technical stakeholder in two sentences, avoiding acronyms.";
+  } else {
+    answer = "You are communicating the main idea. I would tighten the sentence and make the purpose more direct.";
+    natural = `${finishSentence(corrected)} Another natural option is: \u201C${generalAlternative(message)}\u201D`;
+    next = "Use the corrected sentence in a new example about your own IT work.";
+  }
+  return [
+    `**Answer**
+${answer}`,
+    `**Correction**
+${correction}`,
+    `**Why**
+${why}`,
+    `**More natural way to say it**
+${natural}`,
+    `**Try next**
+${next}`
+  ].join("\n\n");
+}
 
 // server/_core/llm.ts
 var ensureArray = (value) => Array.isArray(value) ? value : [value];
@@ -918,12 +1592,59 @@ var normalizeToolChoice = (toolChoice, tools) => {
   }
   return toolChoice;
 };
-var resolveApiUrl = () => ENV.forgeApiUrl && ENV.forgeApiUrl.trim().length > 0 ? `${ENV.forgeApiUrl.replace(/\/$/, "")}/v1/chat/completions` : "https://forge.manus.im/v1/chat/completions";
-var assertApiKey = () => {
-  if (!ENV.forgeApiKey) {
-    throw new Error("OPENAI_API_KEY is not configured");
-  }
+var resolveProviderKey = () => ENV.llmApiKey || ENV.forgeApiKey;
+var resolveApiUrl = () => {
+  const base = ENV.llmApiUrl || ENV.forgeApiUrl;
+  if (!base) return "https://api.openai.com/v1/chat/completions";
+  const trimmed = base.replace(/\/+$/, "");
+  if (/\/chat\/completions$/.test(trimmed)) return trimmed;
+  if (/\/v1$/.test(trimmed)) return `${trimmed}/chat/completions`;
+  return `${trimmed}/v1/chat/completions`;
 };
+var messageText = (message) => {
+  const parts = Array.isArray(message.content) ? message.content : [message.content];
+  return parts.map((part) => typeof part === "string" ? part : part.type === "text" ? part.text : "").join("\n").trim();
+};
+function localInvoke(params) {
+  const lastUser = [...params.messages].reverse().find((message) => message.role === "user");
+  const text2 = lastUser ? messageText(lastUser) : "";
+  const responseFormat = params.response_format ?? params.responseFormat;
+  let content;
+  if (responseFormat?.type === "json_schema" && responseFormat.json_schema.name === "practice_feedback") {
+    const match = text2.match(/Activity type:\s*(\w+)\s*\nPrompt:\s*([\s\S]*?)\nLearner response:\s*([\s\S]*)$/);
+    const activityType = match?.[1] ?? "writing";
+    content = JSON.stringify(
+      localPracticeFeedback({
+        activityType,
+        prompt: match?.[2]?.trim() ?? "",
+        response: match?.[3]?.trim() ?? text2
+      })
+    );
+  } else {
+    const systemPrompt = params.messages.filter((message) => message.role === "system").map(messageText).join("\n");
+    content = localTutorReply({
+      message: text2,
+      systemPrompt,
+      history: params.messages.map((message) => ({
+        role: message.role,
+        content: messageText(message)
+      }))
+    });
+  }
+  return {
+    id: `local-${Date.now()}`,
+    created: Math.floor(Date.now() / 1e3),
+    model: "local-rule-based-coach",
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content },
+        finish_reason: "stop"
+      }
+    ],
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+  };
+}
 var normalizeResponseFormat = ({
   responseFormat,
   response_format,
@@ -1000,7 +1721,11 @@ var fetchWithBackoff = async (url, init) => {
   throw lastError instanceof Error ? lastError : new Error("LLM request failed after exhausting retries");
 };
 async function invokeLLM(params) {
-  assertApiKey();
+  const apiKey = resolveProviderKey();
+  if (!apiKey) {
+    console.warn("[LLM] No AI provider configured; using the offline rule-based coach.");
+    return localInvoke(params);
+  }
   const {
     messages,
     tools,
@@ -1019,8 +1744,9 @@ async function invokeLLM(params) {
   const payload = {
     messages: messages.map(normalizeMessage)
   };
-  if (model) {
-    payload.model = model;
+  const resolvedModel = ENV.llmModel || model;
+  if (resolvedModel) {
+    payload.model = resolvedModel;
   }
   if (tools && tools.length > 0) {
     payload.tools = tools;
@@ -1055,7 +1781,7 @@ async function invokeLLM(params) {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      authorization: `Bearer ${ENV.forgeApiKey}`
+      authorization: `Bearer ${apiKey}`
     },
     body: JSON.stringify(payload)
   });
@@ -1071,18 +1797,13 @@ async function invokeLLM(params) {
 // server/_core/voiceTranscription.ts
 async function transcribeAudio(options) {
   try {
-    if (!ENV.forgeApiUrl) {
+    const providerKey = ENV.llmApiKey || ENV.forgeApiKey;
+    const providerBase = ENV.llmApiUrl || ENV.forgeApiUrl || (ENV.llmApiKey ? "https://api.openai.com/v1" : "");
+    if (!providerBase || !providerKey) {
       return {
-        error: "Voice transcription service is not configured",
+        error: "Voice transcription is not configured. Add an OpenAI-compatible LLM_API_URL and LLM_API_KEY, or the Forge values.",
         code: "SERVICE_ERROR",
-        details: "BUILT_IN_FORGE_API_URL is not set"
-      };
-    }
-    if (!ENV.forgeApiKey) {
-      return {
-        error: "Voice transcription service authentication is missing",
-        code: "SERVICE_ERROR",
-        details: "BUILT_IN_FORGE_API_KEY is not set"
+        details: "No transcription provider is configured"
       };
     }
     let audioBuffer;
@@ -1117,19 +1838,16 @@ async function transcribeAudio(options) {
     const filename = `audio.${getFileExtension(mimeType)}`;
     const audioBlob = new Blob([new Uint8Array(audioBuffer)], { type: mimeType });
     formData.append("file", audioBlob, filename);
-    formData.append("model", "whisper-1");
+    formData.append("model", process.env.TRANSCRIPTION_MODEL || "whisper-1");
     formData.append("response_format", "verbose_json");
     const prompt = options.prompt || (options.language ? `Transcribe the user's voice to text, the user's working language is ${getLanguageName(options.language)}` : "Transcribe the user's voice to text");
     formData.append("prompt", prompt);
-    const baseUrl = ENV.forgeApiUrl.endsWith("/") ? ENV.forgeApiUrl : `${ENV.forgeApiUrl}/`;
-    const fullUrl = new URL(
-      "v1/audio/transcriptions",
-      baseUrl
-    ).toString();
+    const trimmedBase = providerBase.replace(/\/+$/, "");
+    const fullUrl = /\/audio\/transcriptions$/.test(trimmedBase) ? trimmedBase : /\/v1$/.test(trimmedBase) ? `${trimmedBase}/audio/transcriptions` : `${trimmedBase}/v1/audio/transcriptions`;
     const response = await fetch(fullUrl, {
       method: "POST",
       headers: {
-        authorization: `Bearer ${ENV.forgeApiKey}`,
+        authorization: `Bearer ${providerKey}`,
         "Accept-Encoding": "identity"
       },
       body: formData
@@ -1341,18 +2059,17 @@ var systemRouter = router({
 });
 
 // server/storage.ts
+import fs3 from "node:fs";
+import path3 from "node:path";
+var LOCAL_STORAGE_DIR2 = path3.resolve(process.cwd(), ".data", "storage");
 function getForgeConfig() {
   const forgeUrl = ENV.forgeApiUrl;
   const forgeKey = ENV.forgeApiKey;
-  if (!forgeUrl || !forgeKey) {
-    throw new Error(
-      "Storage config missing: set BUILT_IN_FORGE_API_URL and BUILT_IN_FORGE_API_KEY"
-    );
-  }
+  if (!forgeUrl || !forgeKey) return null;
   return { forgeUrl: forgeUrl.replace(/\/+$/, ""), forgeKey };
 }
 function normalizeKey(relKey) {
-  return relKey.replace(/^\/+/, "");
+  return relKey.replace(/^\/+/, "").replace(/\.\.(\/|\\|$)/g, "");
 }
 function appendHashSuffix(relKey) {
   const hash = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
@@ -1360,13 +2077,33 @@ function appendHashSuffix(relKey) {
   if (lastDot === -1) return `${relKey}_${hash}`;
   return `${relKey.slice(0, lastDot)}_${hash}${relKey.slice(lastDot)}`;
 }
+function localPath(key) {
+  return path3.join(LOCAL_STORAGE_DIR2, key);
+}
+function mimeFromKey(key) {
+  const extension = path3.extname(key).toLowerCase();
+  return {
+    ".webm": "audio/webm",
+    ".ogg": "audio/ogg",
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4"
+  }[extension] ?? "application/octet-stream";
+}
 async function storagePut(relKey, data, contentType = "application/octet-stream") {
-  const { forgeUrl, forgeKey } = getForgeConfig();
   const key = appendHashSuffix(normalizeKey(relKey));
-  const presignUrl = new URL("v1/storage/presign/put", forgeUrl + "/");
+  const forge = getForgeConfig();
+  if (!forge) {
+    const file = localPath(key);
+    fs3.mkdirSync(path3.dirname(file), { recursive: true });
+    fs3.writeFileSync(file, typeof data === "string" ? Buffer.from(data) : data);
+    return { key, url: `/manus-storage/${key}` };
+  }
+  const presignUrl = new URL("v1/storage/presign/put", forge.forgeUrl + "/");
   presignUrl.searchParams.set("path", key);
   const presignResp = await fetch(presignUrl, {
-    headers: { Authorization: `Bearer ${forgeKey}` }
+    headers: { Authorization: `Bearer ${forge.forgeKey}` }
   });
   if (!presignResp.ok) {
     const msg = await presignResp.text().catch(() => presignResp.statusText);
@@ -1386,12 +2123,18 @@ async function storagePut(relKey, data, contentType = "application/octet-stream"
   return { key, url: `/manus-storage/${key}` };
 }
 async function storageGetSignedUrl(relKey) {
-  const { forgeUrl, forgeKey } = getForgeConfig();
   const key = normalizeKey(relKey);
-  const getUrl = new URL("v1/storage/presign/get", forgeUrl + "/");
+  const forge = getForgeConfig();
+  if (!forge) {
+    const file = localPath(key);
+    if (!fs3.existsSync(file)) throw new Error("Local storage file not found");
+    const mime = mimeFromKey(key);
+    return `data:${mime};base64,${fs3.readFileSync(file).toString("base64")}`;
+  }
+  const getUrl = new URL("v1/storage/presign/get", forge.forgeUrl + "/");
   getUrl.searchParams.set("path", key);
   const resp = await fetch(getUrl, {
-    headers: { Authorization: `Bearer ${forgeKey}` }
+    headers: { Authorization: `Bearer ${forge.forgeKey}` }
   });
   if (!resp.ok) {
     const msg = await resp.text().catch(() => resp.statusText);
@@ -1425,18 +2168,18 @@ var appRouter = router({
     })
   }),
   profile: router({
-    get: protectedProcedure.query(({ ctx }) => getProfile(ctx.user.id)),
+    get: protectedProcedure.query(({ ctx }) => getProfile2(ctx.user.id)),
     update: protectedProcedure.input(z2.object({
       englishLevel: z2.string().trim().min(2).max(32),
       targetRole: z2.string().trim().min(2).max(120),
       focusAreas: z2.array(z2.string().trim().min(2).max(60)).min(1).max(6),
       dailyGoal: z2.number().int().min(1).max(6)
-    })).mutation(({ ctx, input }) => updateProfile(ctx.user.id, input))
+    })).mutation(({ ctx, input }) => updateProfile2(ctx.user.id, input))
   }),
   tutor: router({
-    listConversations: protectedProcedure.query(({ ctx }) => listConversations(ctx.user.id)),
+    listConversations: protectedProcedure.query(({ ctx }) => listConversations2(ctx.user.id)),
     getConversation: protectedProcedure.input(z2.object({ conversationId: z2.string().min(8).max(24) })).query(async ({ ctx, input }) => {
-      const conversation = await getConversation(ctx.user.id, input.conversationId);
+      const conversation = await getConversation2(ctx.user.id, input.conversationId);
       if (!conversation) throw new TRPCError3({ code: "NOT_FOUND", message: "This tutor conversation was not found." });
       return conversation;
     }),
@@ -1446,17 +2189,17 @@ var appRouter = router({
       message: cleanText
     })).mutation(async ({ ctx, input }) => {
       try {
-        const existing = input.conversationId ? await getConversation(ctx.user.id, input.conversationId) : void 0;
+        const existing = input.conversationId ? await getConversation2(ctx.user.id, input.conversationId) : void 0;
         if (input.conversationId && !existing) throw new TRPCError3({ code: "NOT_FOUND", message: "This tutor conversation was not found." });
-        const conversation = existing?.conversation ?? await createConversation(ctx.user.id, input.mode, input.message.slice(0, 72));
-        await addMessage(ctx.user.id, conversation.id, "user", input.message);
-        const history = await getConversation(ctx.user.id, conversation.id);
+        const conversation = existing?.conversation ?? await createConversation2(ctx.user.id, input.mode, input.message.slice(0, 72));
+        await addMessage2(ctx.user.id, conversation.id, "user", input.message);
+        const history = await getConversation2(ctx.user.id, conversation.id);
         const response = await invokeLLM({
           model: "gpt-5-mini",
           messages: [{ role: "system", content: tutorSystemPrompt(conversation.mode) }, ...(history?.messages ?? []).slice(-12).map((message) => ({ role: message.role, content: message.content }))]
         });
         const content = assistantText(response);
-        await addMessage(ctx.user.id, conversation.id, "assistant", content);
+        await addMessage2(ctx.user.id, conversation.id, "assistant", content);
         return { conversationId: conversation.id, assistantMessage: content };
       } catch (error) {
         throw aiError(error);
@@ -1489,7 +2232,7 @@ Learner response: ${input.response}` }
           } } }
         });
         const feedback = parsePracticeFeedback(assistantText(response));
-        await savePracticeAttempt(ctx.user.id, { ...input, feedback });
+        await savePracticeAttempt2(ctx.user.id, { ...input, feedback });
         return feedback;
       } catch (error) {
         throw aiError(error);
@@ -1498,14 +2241,14 @@ Learner response: ${input.response}` }
   }),
   career: router({
     list: protectedProcedure.query(async ({ ctx }) => {
-      const complete = new Set((await getScenarioCompletions(ctx.user.id)).map((item) => item.scenarioSlug));
+      const complete = new Set((await getScenarioCompletions2(ctx.user.id)).map((item) => item.scenarioSlug));
       return careerScenarios.map((scenario) => ({ ...scenario, modeLabel: tutorModeLabels[scenario.mode], completed: complete.has(scenario.slug) }));
     }),
     start: protectedProcedure.input(z2.object({ slug: z2.string().min(3).max(80) })).mutation(async ({ ctx, input }) => {
       const scenario = careerScenarios.find((item) => item.slug === input.slug);
       if (!scenario) throw new TRPCError3({ code: "NOT_FOUND", message: "This career scenario was not found." });
-      const conversation = await createConversation(ctx.user.id, scenario.mode, scenario.title, scenario.slug);
-      await addMessage(ctx.user.id, conversation.id, "assistant", `## ${scenario.title}
+      const conversation = await createConversation2(ctx.user.id, scenario.mode, scenario.title, scenario.slug);
+      await addMessage2(ctx.user.id, conversation.id, "assistant", `## ${scenario.title}
 
 We will practise this IT communication situation together. I will respond like a supportive colleague or interviewer, then help you improve your English.
 
@@ -1515,41 +2258,41 @@ Write your first answer when you are ready.`);
       return { conversationId: conversation.id };
     }),
     complete: protectedProcedure.input(z2.object({ slug: z2.string().min(3).max(80), conversationId: z2.string().min(8).max(24) })).mutation(async ({ ctx, input }) => {
-      const conversation = await getConversation(ctx.user.id, input.conversationId);
+      const conversation = await getConversation2(ctx.user.id, input.conversationId);
       if (!conversation || conversation.conversation.scenarioSlug !== input.slug) throw new TRPCError3({ code: "NOT_FOUND", message: "This guided scenario was not found." });
-      await completeScenario(ctx.user.id, input.slug, input.conversationId);
+      await completeScenario2(ctx.user.id, input.slug, input.conversationId);
       return { success: true };
     })
   }),
   flashcards: router({
-    list: protectedProcedure.query(({ ctx }) => listFlashcards(ctx.user.id)),
+    list: protectedProcedure.query(({ ctx }) => listFlashcards2(ctx.user.id)),
     save: protectedProcedure.input(z2.object({
       term: z2.string().trim().min(2).max(100),
       definition: z2.string().trim().max(500).optional(),
       example: z2.string().trim().max(500).optional(),
       conversationId: z2.string().min(8).max(24).optional()
     })).mutation(async ({ ctx, input }) => {
-      if (input.conversationId && !await getConversation(ctx.user.id, input.conversationId)) {
+      if (input.conversationId && !await getConversation2(ctx.user.id, input.conversationId)) {
         throw new TRPCError3({ code: "NOT_FOUND", message: "This tutor conversation was not found." });
       }
-      return saveFlashcard(ctx.user.id, {
+      return saveFlashcard2(ctx.user.id, {
         term: input.term,
         definition: input.definition || "Saved from your AI tutor feedback.",
         example: input.example || "Review this term in a sentence from your own IT work.",
         sourceConversationId: input.conversationId
       });
     }),
-    markReviewed: protectedProcedure.input(z2.object({ flashcardId: z2.string().min(8).max(24) })).mutation(({ ctx, input }) => markFlashcardReviewed(ctx.user.id, input.flashcardId))
+    markReviewed: protectedProcedure.input(z2.object({ flashcardId: z2.string().min(8).max(24) })).mutation(({ ctx, input }) => markFlashcardReviewed2(ctx.user.id, input.flashcardId))
   }),
   challenge: router({
     get: protectedProcedure.query(async ({ ctx }) => {
       const challenge = getDailyChallenge();
-      const completion = await getChallengeCompletion(ctx.user.id, challenge.date);
+      const completion = await getChallengeCompletion2(ctx.user.id, challenge.date);
       return { ...challenge, completed: Boolean(completion), response: completion?.response ?? null };
     }),
     complete: protectedProcedure.input(z2.object({ response: cleanText })).mutation(async ({ ctx, input }) => {
       const challenge = getDailyChallenge();
-      await completeDailyChallenge(ctx.user.id, { challengeDate: challenge.date, challengeId: challenge.id, response: input.response });
+      await completeDailyChallenge2(ctx.user.id, { challengeDate: challenge.date, challengeId: challenge.id, response: input.response });
       return { success: true, challengeDate: challenge.date };
     })
   }),
@@ -1559,7 +2302,7 @@ Write your first answer when you are ready.`);
       audioBase64: z2.string().min(32).max(7e6),
       mimeType: z2.enum(supportedAudioMimes)
     })).mutation(async ({ ctx, input }) => {
-      const conversation = await getConversation(ctx.user.id, input.conversationId);
+      const conversation = await getConversation2(ctx.user.id, input.conversationId);
       if (!conversation?.conversation.scenarioSlug) throw new TRPCError3({ code: "BAD_REQUEST", message: "Voice input is available only inside a career role-play." });
       if (!isSupportedAudioMime(input.mimeType)) throw new TRPCError3({ code: "BAD_REQUEST", message: "This audio format is not supported." });
       const audio = Buffer.from(input.audioBase64, "base64");
@@ -1580,7 +2323,7 @@ Write your first answer when you are ready.`);
       }
     })
   }),
-  progress: router({ overview: protectedProcedure.query(({ ctx }) => getProgressOverview(ctx.user.id)) })
+  progress: router({ overview: protectedProcedure.query(({ ctx }) => getProgressOverview2(ctx.user.id)) })
 });
 
 // server/_core/context.ts
@@ -1603,7 +2346,15 @@ function createApp() {
   const app = express();
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
+  app.get("/api/health", (_req, res) => {
+    res.json({
+      status: "ok",
+      auth: isLocalAuthEnabled() ? "local" : "oauth",
+      time: (/* @__PURE__ */ new Date()).toISOString()
+    });
+  });
   registerStorageProxy(app);
+  registerLocalAuthRoutes(app);
   registerOAuthRoutes(app);
   app.use("/api/trpc", createExpressMiddleware({ router: appRouter, createContext }));
   return app;

@@ -136,6 +136,95 @@ export function calculateStreak(completionDates: Date[], now = new Date()): numb
   return streak;
 }
 
+export type ProgressOverview = {
+  dailyGoal: number;
+  todaySessions: number;
+  streak: number;
+  completedSessions: number;
+  vocabularyLearned: number;
+  flashcardsCount: number;
+  errorCategories: Array<{ name: string; value: number }>;
+  recentActivity: Array<{
+    id: string;
+    title: string;
+    date: Date;
+    score: number | null;
+    kind: "practice" | "career" | "challenge";
+  }>;
+};
+
+export function buildProgressOverview(input: {
+  dailyGoal: number;
+  attempts: Array<{
+    id: string;
+    activityType: string;
+    score: number;
+    completedAt: Date;
+    feedback: { errorCategories: string[] };
+  }>;
+  completions: Array<{ id: string; completedAt: Date }>;
+  challenges: Array<{ id: string; completedAt: Date }>;
+  flashcards: Array<unknown>;
+}): ProgressOverview {
+  const { dailyGoal, attempts, completions, challenges, flashcards } = input;
+  const activityDates = [
+    ...attempts.map(item => item.completedAt),
+    ...completions.map(item => item.completedAt),
+    ...challenges.map(item => item.completedAt),
+  ];
+  const errorMap = new Map<string, number>();
+  attempts.forEach(item =>
+    item.feedback.errorCategories.forEach(category =>
+      errorMap.set(category, (errorMap.get(category) ?? 0) + 1)
+    )
+  );
+  const errorCategories = Array.from(errorMap.entries())
+    .map(([name, value]) => ({ name, value }))
+    .sort((a, b) => b.value - a.value)
+    .slice(0, 5);
+  const recentActivity = [
+    ...attempts.map(item => ({
+      id: item.id,
+      title: `${item.activityType[0].toUpperCase()}${item.activityType.slice(1)} practice completed`,
+      date: item.completedAt,
+      score: item.score,
+      kind: "practice" as const,
+    })),
+    ...completions.map(item => ({
+      id: item.id,
+      title: "Career scenario completed",
+      date: item.completedAt,
+      score: null,
+      kind: "career" as const,
+    })),
+    ...challenges.map(item => ({
+      id: item.id,
+      title: "Daily IT-English challenge completed",
+      date: item.completedAt,
+      score: null,
+      kind: "challenge" as const,
+    })),
+  ]
+    .sort((a, b) => b.date.getTime() - a.date.getTime())
+    .slice(0, 6);
+  const today = new Date().toISOString().slice(0, 10);
+  const todaySessions = activityDates.filter(date => date.toISOString().slice(0, 10) === today).length;
+
+  return {
+    dailyGoal,
+    todaySessions,
+    streak: calculateStreak(activityDates),
+    completedSessions: activityDates.length,
+    vocabularyLearned: Math.max(
+      flashcards.length,
+      attempts.filter(item => item.activityType === "vocabulary" && item.score >= 70).length * 5
+    ),
+    flashcardsCount: flashcards.length,
+    errorCategories,
+    recentActivity,
+  };
+}
+
 export const dailyChallenges = [
   {
     id: "incident-summary",

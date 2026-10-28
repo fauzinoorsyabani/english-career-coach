@@ -2,6 +2,18 @@ import { OAUTH_STATE_COOKIE, encodeOAuthState } from "@shared/const";
 
 export { COOKIE_NAME, ONE_YEAR_MS } from "@shared/const";
 
+const oauthPortalUrl = import.meta.env.VITE_OAUTH_PORTAL_URL;
+const appId = import.meta.env.VITE_APP_ID;
+
+/**
+ * Local demo sign-in is used when the project runs without Manus OAuth
+ * credentials. Set VITE_LOCAL_AUTH=true for a local production build, or omit
+ * the OAuth variables during development.
+ */
+export const isLocalAuthEnabled =
+  import.meta.env.VITE_LOCAL_AUTH === "true" ||
+  (import.meta.env.DEV && (!oauthPortalUrl || !appId));
+
 // Start the Manus OAuth login. Call this from an event handler or effect at the
 // moment you want to navigate, e.g. `onClick={() => startLogin()}`.
 //
@@ -13,12 +25,17 @@ export { COOKIE_NAME, ONE_YEAR_MS } from "@shared/const";
 // with "invalid oauth state". It returns void by design, so there is no URL to
 // stash across renders.
 export const startLogin = () => {
-  const oauthPortalUrl = import.meta.env.VITE_OAUTH_PORTAL_URL;
-  const appId = import.meta.env.VITE_APP_ID;
-  const redirectUri = `${window.location.origin}/api/oauth/callback`;
+  const returnTo = `${window.location.pathname}${window.location.search}`;
 
+  if (isLocalAuthEnabled) {
+    window.location.href = `/api/auth/local?returnTo=${encodeURIComponent(returnTo)}`;
+    return;
+  }
+
+  const redirectUri = `${window.location.origin}/api/oauth/callback`;
   const nonce = crypto.randomUUID();
-  document.cookie = `${OAUTH_STATE_COOKIE}=${nonce}; Path=/; Max-Age=600; SameSite=None; Secure`;
+  const secure = window.location.protocol === "https:";
+  document.cookie = `${OAUTH_STATE_COOKIE}=${nonce}; Path=/; Max-Age=600; SameSite=${secure ? "None" : "Lax"}${secure ? "; Secure" : ""}`;
   const state = encodeOAuthState({ redirectUri, nonce });
 
   const url = new URL(`${oauthPortalUrl}/app-auth`);

@@ -1,24 +1,23 @@
-// Preconfigured storage helpers for Manus WebDev templates
-// Uploads via Forge Server presigned URL to S3 (PUT direct).
-// Downloads return /manus-storage/{key} paths served via 307 redirect.
+// Storage helpers. Manus Forge + S3 is used when configured; otherwise files are
+// kept in the local `.data/storage` folder so demo mode works without cloud keys.
 
+import fs from "node:fs";
+import path from "node:path";
 import { ENV } from "./_core/env";
+
+const LOCAL_STORAGE_DIR = path.resolve(process.cwd(), ".data", "storage");
 
 function getForgeConfig() {
   const forgeUrl = ENV.forgeApiUrl;
   const forgeKey = ENV.forgeApiKey;
 
-  if (!forgeUrl || !forgeKey) {
-    throw new Error(
-      "Storage config missing: set BUILT_IN_FORGE_API_URL and BUILT_IN_FORGE_API_KEY",
-    );
-  }
+  if (!forgeUrl || !forgeKey) return null;
 
   return { forgeUrl: forgeUrl.replace(/\/+$/, ""), forgeKey };
 }
 
 function normalizeKey(relKey: string): string {
-  return relKey.replace(/^\/+/, "");
+  return relKey.replace(/^\/+/, "").replace(/\.\.(\/|\\|$)/g, "");
 }
 
 function appendHashSuffix(relKey: string): string {
@@ -28,20 +27,45 @@ function appendHashSuffix(relKey: string): string {
   return `${relKey.slice(0, lastDot)}_${hash}${relKey.slice(lastDot)}`;
 }
 
+function localPath(key: string) {
+  return path.join(LOCAL_STORAGE_DIR, key);
+}
+
+function mimeFromKey(key: string) {
+  const extension = path.extname(key).toLowerCase();
+  return (
+    {
+      ".webm": "audio/webm",
+      ".ogg": "audio/ogg",
+      ".wav": "audio/wav",
+      ".mp3": "audio/mpeg",
+      ".m4a": "audio/mp4",
+      ".mp4": "audio/mp4",
+    }[extension] ?? "application/octet-stream"
+  );
+}
+
 export async function storagePut(
   relKey: string,
   data: Buffer | Uint8Array | string,
   contentType = "application/octet-stream",
 ): Promise<{ key: string; url: string }> {
-  const { forgeUrl, forgeKey } = getForgeConfig();
   const key = appendHashSuffix(normalizeKey(relKey));
+  const forge = getForgeConfig();
+
+  if (!forge) {
+    const file = localPath(key);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, typeof data === "string" ? Buffer.from(data) : data);
+    return { key, url: `/manus-storage/${key}` };
+  }
 
   // 1. Get presigned PUT URL from Forge
-  const presignUrl = new URL("v1/storage/presign/put", forgeUrl + "/");
+  const presignUrl = new URL("v1/storage/presign/put", forge.forgeUrl + "/");
   presignUrl.searchParams.set("path", key);
 
   const presignResp = await fetch(presignUrl, {
-    headers: { Authorization: `Bearer ${forgeKey}` },
+    headers: { Authorization: `Bearer ${forge.forgeKey}` },
   });
 
   if (!presignResp.ok) {
@@ -77,14 +101,21 @@ export async function storageGet(relKey: string): Promise<{ key: string; url: st
 }
 
 export async function storageGetSignedUrl(relKey: string): Promise<string> {
-  const { forgeUrl, forgeKey } = getForgeConfig();
   const key = normalizeKey(relKey);
+  const forge = getForgeConfig();
 
-  const getUrl = new URL("v1/storage/presign/get", forgeUrl + "/");
+  if (!forge) {
+    const file = localPath(key);
+    if (!fs.existsSync(file)) throw new Error("Local storage file not found");
+    const mime = mimeFromKey(key);
+    return `data:${mime};base64,${fs.readFileSync(file).toString("base64")}`;
+  }
+
+  const getUrl = new URL("v1/storage/presign/get", forge.forgeUrl + "/");
   getUrl.searchParams.set("path", key);
 
   const resp = await fetch(getUrl, {
-    headers: { Authorization: `Bearer ${forgeKey}` },
+    headers: { Authorization: `Bearer ${forge.forgeKey}` },
   });
 
   if (!resp.ok) {

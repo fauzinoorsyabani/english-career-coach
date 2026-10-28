@@ -1,5 +1,9 @@
+import fs from "node:fs";
+import path from "node:path";
 import type { Express } from "express";
 import { ENV } from "./env";
+
+const LOCAL_STORAGE_DIR = path.resolve(process.cwd(), ".data", "storage");
 
 export function registerStorageProxy(app: Express) {
   app.get("/manus-storage/*", async (req, res) => {
@@ -10,7 +14,13 @@ export function registerStorageProxy(app: Express) {
     }
 
     if (!ENV.forgeApiUrl || !ENV.forgeApiKey) {
-      res.status(500).send("Storage proxy not configured");
+      const safeKey = key.replace(/\.\.(\/|\\|$)/g, "");
+      const file = path.join(LOCAL_STORAGE_DIR, safeKey);
+      if (fs.existsSync(file) && file.startsWith(LOCAL_STORAGE_DIR)) {
+        res.sendFile(file);
+        return;
+      }
+      res.status(404).send("Storage file not found");
       return;
     }
 

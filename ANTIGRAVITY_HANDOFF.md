@@ -28,16 +28,37 @@ Clone the repository, install Node.js 22 or later, and use pnpm.
 git clone https://github.com/fauzinoorsyabani/english-career-coach.git
 cd english-career-coach
 pnpm install
+cp .env.example .env
+pnpm dev
 ```
 
-Create a local `.env` file. Do **not** commit it. The application needs at least a MySQL-compatible `DATABASE_URL` and a strong `JWT_SECRET` to persist authenticated learning data locally. Consult `VERCEL_ENVIRONMENT.md` for the complete current integration variable list.
+The checked-in `.env.example` starts the app in **local demo mode**:
+
+```env
+LOCAL_AUTH=true
+LOCAL_DATA=true
+VITE_LOCAL_AUTH=true
+JWT_SECRET=english-career-coach-local-development-secret
+```
+
+Open the printed URL (usually <http://localhost:3000>, or the next free port) and select **Enter the local demo**. No external account is required. The demo user is `Alex Morgan`; learning data is stored in `.data/local-db.json`, which is ignored by Git. Delete that file to reset the workspace.
+
+The built-in offline coach provides rule-based tutor replies and practice feedback when no AI provider is configured. For richer feedback, add any OpenAI-compatible provider:
+
+```env
+LLM_API_URL=https://api.openai.com/v1
+LLM_API_KEY=sk-your-key
+LLM_MODEL=gpt-4o-mini
+```
+
+### Connected mode
+
+To use a real database instead of the local JSON store, set a MySQL-compatible `DATABASE_URL` and remove `LOCAL_DATA=true`. The original integration can also use Manus OAuth and Manus Forge services for AI tutoring, S3-backed audio storage, and transcription. Those values are platform credentials and are not included in the repository; replace them with the providers you prefer. See `VERCEL_ENVIRONMENT.md` for the full variable list.
 
 ```env
 DATABASE_URL=mysql://USER:PASSWORD@HOST:3306/english_career_coach
 JWT_SECRET=replace-with-a-long-random-value
 ```
-
-The existing integration uses Manus OAuth and Manus Forge services for AI tutoring, S3-backed audio storage, and transcription. Those values are platform credentials and are not included in the repository. For an independent external build, replace them with the providers you prefer.
 
 ## Database workflow
 

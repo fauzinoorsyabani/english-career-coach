@@ -134,5 +134,6 @@ export type LearnerProfile = typeof learnerProfiles.$inferSelect;
 export type TutorConversation = typeof tutorConversations.$inferSelect;
 export type TutorMessage = typeof tutorMessages.$inferSelect;
 export type PracticeAttempt = typeof practiceAttempts.$inferSelect;
+export type ScenarioCompletion = typeof scenarioCompletions.$inferSelect;
 export type VocabularyFlashcard = typeof vocabularyFlashcards.$inferSelect;
 export type DailyChallengeCompletion = typeof dailyChallengeCompletions.$inferSelect;

@@ -1,7 +1,7 @@
 import { useAuth } from "@/_core/hooks/useAuth";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
-import { startLogin } from "@/const";
+import { startLogin, isLocalAuthEnabled } from "@/const";
 import { BarChart3, BookOpenCheck, BriefcaseBusiness, Loader2, LogOut, MessageCircleHeart, Settings2, Sparkles } from "lucide-react";
 import { useLocation } from "wouter";
 
@@ -37,7 +37,14 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
         <p className="mb-3 text-xs font-bold uppercase tracking-[0.18em] text-accent">Your English study lab</p>
         <h1 className="editorial-title text-4xl font-semibold">Make English part of your IT career.</h1>
         <p className="mt-4 text-sm leading-6 text-muted-foreground">Sign in to save tutor conversations, practice feedback, and career progress in one private workspace.</p>
-        <Button onClick={() => startLogin()} className="mt-7 w-full rounded-xl bg-accent text-accent-foreground hover:bg-accent/90">Sign in to begin</Button>
+        {isLocalAuthEnabled && (
+          <p className="mt-4 rounded-xl bg-secondary px-4 py-3 text-xs leading-5 text-muted-foreground">
+            Local demo mode: your data is stored on this machine. No external account is needed.
+          </p>
+        )}
+        <Button onClick={() => startLogin()} className="mt-7 w-full rounded-xl bg-accent text-accent-foreground hover:bg-accent/90">
+          {isLocalAuthEnabled ? "Enter the local demo" : "Sign in to begin"}
+        </Button>
       </section>
     </div>
   );

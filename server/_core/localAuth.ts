@@ -1,9 +1,7 @@
-import { COOKIE_NAME, ONE_YEAR_MS } from "@shared/const";
 import type { Express, Request, Response } from "express";
 import * as db from "../db";
-import { getSessionCookieOptions } from "./cookies";
+import { issueSession } from "../authService";
 import { ENV } from "./env";
-import { sdk } from "./sdk";
 
 export const LOCAL_DEMO_OPEN_ID = "local-demo-user";
 
@@ -17,10 +15,37 @@ export function isLocalAuthEnabled() {
   return ENV.localAuthEnabled;
 }
 
+/**
+ * Email/password accounts are the application's own identity layer. They are
+ * available wherever the app is deployed and do not depend on the one-click
+ * demo account. Set `PASSWORD_AUTH=false` to run an SSO-only deployment.
+ */
+export function isPasswordAuthEnabled() {
+  return process.env.PASSWORD_AUTH !== "false";
+}
+
 function safeReturnTo(value: unknown) {
   if (typeof value !== "string") return "/";
   if (!value.startsWith("/") || value.startsWith("//")) return "/";
+  if (value.startsWith("/login")) return "/";
   return value;
+}
+
+async function ensureDemoUser() {
+  let user = await db.getUserByOpenId(LOCAL_DEMO_OPEN_ID);
+  if (!user) {
+    await db.upsertUser({
+      openId: LOCAL_DEMO_OPEN_ID,
+      name: "Alex Morgan",
+      email: "alex.morgan@example.com",
+      loginMethod: "local",
+      role: "user",
+      status: "active",
+      lastSignedIn: new Date(),
+    });
+    user = await db.getUserByOpenId(LOCAL_DEMO_OPEN_ID);
+  }
+  return user;
 }
 
 export function registerLocalAuthRoutes(app: Express) {
@@ -34,24 +59,10 @@ export function registerLocalAuthRoutes(app: Express) {
     }
 
     try {
-      await db.upsertUser({
-        openId: LOCAL_DEMO_OPEN_ID,
-        name: "Alex Morgan",
-        email: "alex.morgan@example.com",
-        loginMethod: "local",
-        lastSignedIn: new Date(),
-      });
+      const user = await ensureDemoUser();
+      if (!user) throw new Error("Demo user could not be created");
 
-      const user = await db.getUserByOpenId(LOCAL_DEMO_OPEN_ID);
-      const sessionToken = await sdk.createSessionToken(LOCAL_DEMO_OPEN_ID, {
-        name: user?.name || "Alex Morgan",
-        expiresInMs: ONE_YEAR_MS,
-      });
-
-      res.cookie(COOKIE_NAME, sessionToken, {
-        ...getSessionCookieOptions(req),
-        maxAge: ONE_YEAR_MS,
-      });
+      await issueSession(req, res, user);
       res.redirect(302, safeReturnTo(req.query.returnTo));
     } catch (error) {
       console.error("[LocalAuth] Sign-in failed", error);

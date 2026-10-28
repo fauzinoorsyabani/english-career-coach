@@ -1,4 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="English Career Coach">
-  <rect width="64" height="64" rx="16" fill="#182238"/>
-  <text x="32" y="42" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-size="25" font-weight="700" fill="#F3EFE4">EC</text>
+  <rect width="64" height="64" rx="14" fill="#113634"/>
+  <path d="M14 14h8M14 14v8" stroke="#EFC262" stroke-width="3" stroke-linecap="round"/>
+  <path d="M50 50h-8M50 50v-8" stroke="#EFC262" stroke-width="3" stroke-linecap="round"/>
+  <text x="32" y="42" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-size="24" font-weight="700" fill="#F7F5EE">EC</text>
 </svg>

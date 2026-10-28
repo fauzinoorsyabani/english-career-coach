@@ -1,10 +1,11 @@
 import express from "express";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
-import { isLocalAuthEnabled, registerLocalAuthRoutes } from "./localAuth";
+import { isLocalAuthEnabled, isPasswordAuthEnabled, registerLocalAuthRoutes } from "./localAuth";
 import { registerOAuthRoutes } from "./oauth";
 import { registerStorageProxy } from "./storageProxy";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
+import { getStorageMode } from "../localData";
 
 export function createApp() {
   const app = express();
@@ -13,7 +14,9 @@ export function createApp() {
   app.get("/api/health", (_req, res) => {
     res.json({
       status: "ok",
-      auth: isLocalAuthEnabled() ? "local" : "oauth",
+      auth: isPasswordAuthEnabled() ? "email-password" : "disabled",
+      demoAuth: isLocalAuthEnabled(),
+      storage: getStorageMode(),
       time: new Date().toISOString(),
     });
   });

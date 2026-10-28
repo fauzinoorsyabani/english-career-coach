@@ -22,6 +22,7 @@ export type SessionPayload = {
   openId: string;
   appId: string;
   name: string;
+  sid?: string;
 };
 
 const EXCHANGE_TOKEN_PATH = `/webdev.v1.WebDevAuthPublicService/ExchangeToken`;
@@ -169,7 +170,7 @@ class SDKServer {
    */
   async createSessionToken(
     openId: string,
-    options: { expiresInMs?: number; name?: string } = {}
+    options: { expiresInMs?: number; name?: string; sessionId?: string } = {}
   ): Promise<string> {
     return this.signSession(
       {
@@ -178,6 +179,7 @@ class SDKServer {
         // needs a non-empty appId to pass verification.
         appId: ENV.appId || "local-demo",
         name: options.name || "",
+        sid: options.sessionId,
       },
       options
     );
@@ -196,6 +198,7 @@ class SDKServer {
       openId: payload.openId,
       appId: payload.appId,
       name: payload.name,
+      ...(payload.sid ? { sid: payload.sid } : {}),
     })
       .setProtectedHeader({ alg: "HS256", typ: "JWT" })
       .setExpirationTime(expirationSeconds)
@@ -204,7 +207,7 @@ class SDKServer {
 
   async verifySession(
     cookieValue: string | undefined | null
-  ): Promise<{ openId: string; appId: string; name: string } | null> {
+  ): Promise<{ openId: string; appId: string; name: string; sid?: string } | null> {
     if (!cookieValue) {
       console.warn("[Auth] Missing session cookie");
       return null;
@@ -215,7 +218,7 @@ class SDKServer {
       const { payload } = await jwtVerify(cookieValue, secretKey, {
         algorithms: ["HS256"],
       });
-      const { openId, appId, name } = payload as Record<string, unknown>;
+      const { openId, appId, name, sid } = payload as Record<string, unknown>;
 
       if (
         !isNonEmptyString(openId) ||
@@ -230,6 +233,7 @@ class SDKServer {
         openId,
         appId,
         name,
+        ...(isNonEmptyString(sid) ? { sid } : {}),
       };
     } catch (error) {
       console.warn("[Auth] Session verification failed", String(error));
@@ -282,6 +286,14 @@ class SDKServer {
       throw ForbiddenError("Invalid session cookie");
     }
 
+    // Password and demo sessions are tracked so they can be revoked from the
+    // account settings or by an administrator. Legacy OAuth tokens have no
+    // session id and continue to work without a database row.
+    const trackedSession = session.sid ? await db.getSession(session.sid) : null;
+    if (session.sid && !trackedSession) {
+      throw ForbiddenError("This session has expired or was signed out.");
+    }
+
     if (session.openId.startsWith(CRON_OPEN_ID_PREFIX)) {
       const userInfo = await this.getUserInfoWithJwt(sessionToken ?? "");
       const taskUid = userInfo.taskUid ?? null;
@@ -295,7 +307,21 @@ class SDKServer {
     const signedInAt = new Date();
     let user = await db.getUserByOpenId(sessionUserId);
 
-    // If user not in DB, sync from OAuth server automatically
+    // Password sign-in sessions carry a server-side session id. Validate it so
+    // signing out of one device, changing a password, or deleting an account
+    // revokes the token immediately instead of waiting for JWT expiry.
+    if (session.sid) {
+      if (!user || !trackedSession || trackedSession.userId !== user.id) {
+        throw ForbiddenError("Session has been revoked");
+      }
+      const fiveMinutesAgo = Date.now() - 5 * 60 * 1000;
+      if (trackedSession.lastSeenAt.getTime() < fiveMinutesAgo) {
+        await db.touchSession(trackedSession.id, signedInAt);
+      }
+    }
+
+    // If user not in DB, sync from OAuth server automatically (OAuth sessions
+    // only; password sessions were validated above).
     if (!user) {
       try {
         const userInfo = await this.getUserInfoWithJwt(sessionToken ?? "");
@@ -317,12 +343,23 @@ class SDKServer {
       throw ForbiddenError("User not found");
     }
 
-    await db.upsertUser({
-      openId: user.openId,
-      lastSignedIn: signedInAt,
-    });
+    if (user.status === "disabled") {
+      if (session.sid) await db.revokeSession(user.id, session.sid);
+      throw ForbiddenError("This account has been disabled.");
+    }
 
-    return user;
+    // Preserve a useful "last active" timestamp without writing on every
+    // request. Redis-backed mode makes each write a full document update.
+    const lastSignedInAt = user.lastSignedIn?.getTime() ?? 0;
+    if (Date.now() - lastSignedInAt > 60 * 60 * 1000) {
+      await db.upsertUser({
+        openId: user.openId,
+        lastSignedIn: signedInAt,
+      });
+      user = { ...user, lastSignedIn: signedInAt };
+    }
+
+    return session.sid ? { ...user, sessionId: session.sid } : user;
   }
 }
 
@@ -332,6 +369,7 @@ const CRON_OPEN_ID_PREFIX = "cron_";
 export type AuthenticatedUser = User & {
   taskUid?: string;
   isCron?: boolean;
+  sessionId?: string;
 };
 
 function buildCronUser(
@@ -343,8 +381,10 @@ function buildCronUser(
     openId: userInfo.openId,
     name: userInfo.name || "Manus Scheduled Task",
     email: null,
+    passwordHash: null,
     loginMethod: null,
     role: "user",
+    status: "active",
     createdAt: now,
     updatedAt: now,
     lastSignedIn: now,

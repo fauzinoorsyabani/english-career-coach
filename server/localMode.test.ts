@@ -9,66 +9,70 @@ process.env.LOCAL_DATA_FILE = path.join(
   `english-career-coach-test-${Date.now()}-${Math.random().toString(36).slice(2)}.json`
 );
 
-beforeEach(() => {
-  local.resetLocalDataForTests();
+beforeEach(async () => {
+  await local.resetLocalDataForTests();
 });
 
 describe("local data store", () => {
-  it("creates users and persists profile changes", () => {
-    const user = local.upsertUser({ openId: "learner-one", name: "Alex" });
+  it("creates users and persists profile changes", async () => {
+    const user = await local.upsertUser({ openId: "learner-one", name: "Alex" });
     expect(user.id).toBeGreaterThan(0);
-    expect(local.getUserByOpenId("learner-one")?.name).toBe("Alex");
+    expect((await local.getUserByOpenId("learner-one"))?.name).toBe("Alex");
 
-    const profile = local.getProfile(user.id);
+    const profile = await local.getProfile(user.id);
     expect(profile.englishLevel).toBe("Intermediate");
 
-    const updated = local.updateProfile(user.id, {
+    const updated = await local.updateProfile(user.id, {
       englishLevel: "Advanced",
       targetRole: "Business Analyst",
       focusAreas: ["Workplace English"],
       dailyGoal: 2,
     });
     expect(updated.englishLevel).toBe("Advanced");
-    expect(local.getProfile(user.id).dailyGoal).toBe(2);
+    expect((await local.getProfile(user.id)).dailyGoal).toBe(2);
   });
 
-  it("scopes tutor conversations and messages to their owner", () => {
-    const first = local.upsertUser({ openId: "learner-one", name: "Alex" });
-    const second = local.upsertUser({ openId: "learner-two", name: "Sam" });
-    const conversation = local.createConversation(first.id, "workplace", "Stand-up practice");
-    local.addMessage(first.id, conversation.id, "user", "Yesterday I finished the API work.");
+  it("scopes tutor conversations and messages to their owner", async () => {
+    const first = await local.upsertUser({ openId: "learner-one", name: "Alex" });
+    const second = await local.upsertUser({ openId: "learner-two", name: "Sam" });
+    const conversation = await local.createConversation(
+      first.id,
+      "workplace",
+      "Stand-up practice"
+    );
+    await local.addMessage(first.id, conversation.id, "user", "Yesterday I finished the API work.");
 
-    expect(local.getConversation(first.id, conversation.id)?.messages).toHaveLength(1);
-    expect(local.getConversation(second.id, conversation.id)).toBeUndefined();
-    expect(local.listConversations(second.id)).toHaveLength(0);
+    expect((await local.getConversation(first.id, conversation.id))?.messages).toHaveLength(1);
+    expect(await local.getConversation(second.id, conversation.id)).toBeUndefined();
+    expect(await local.listConversations(second.id)).toHaveLength(0);
   });
 
-  it("persists practice, flashcards, scenarios, challenges and progress", () => {
-    const user = local.upsertUser({ openId: "learner-one", name: "Alex" });
+  it("persists practice, flashcards, scenarios, challenges and progress", async () => {
+    const user = await local.upsertUser({ openId: "learner-one", name: "Alex" });
     const feedback = localPracticeFeedback({
       activityType: "grammar",
       prompt: "Correct this sentence.",
       response: "I am agree with the plan.",
     });
-    local.savePracticeAttempt(user.id, {
+    await local.savePracticeAttempt(user.id, {
       activityType: "grammar",
       prompt: "Correct this sentence.",
       response: "I am agree with the plan.",
       feedback,
     });
-    local.saveFlashcard(user.id, {
+    await local.saveFlashcard(user.id, {
       term: "blocker",
       definition: "Something that prevents progress.",
       example: "My only blocker is access.",
     });
-    local.completeScenario(user.id, "daily-stand-up", "conversation-id");
-    local.completeDailyChallenge(user.id, {
+    await local.completeScenario(user.id, "daily-stand-up", "conversation-id");
+    await local.completeDailyChallenge(user.id, {
       challengeDate: "2026-10-28",
       challengeId: "incident-summary",
       response: "The portal is unavailable.",
     });
 
-    const progress = local.getProgressOverview(user.id);
+    const progress = await local.getProgressOverview(user.id);
     expect(progress.completedSessions).toBe(3);
     expect(progress.flashcardsCount).toBe(1);
     expect(progress.errorCategories.some(item => item.name === "Grammar")).toBe(true);
@@ -76,20 +80,22 @@ describe("local data store", () => {
     expect(progress.streak).toBe(1);
   });
 
-  it("keeps daily challenge completion idempotent per user and date", () => {
-    const user = local.upsertUser({ openId: "learner-one", name: "Alex" });
+  it("keeps daily challenge completion idempotent per user and date", async () => {
+    const user = await local.upsertUser({ openId: "learner-one", name: "Alex" });
     const input = {
       challengeDate: "2026-10-28",
       challengeId: "incident-summary",
       response: "First response",
     };
-    local.completeDailyChallenge(user.id, input);
-    local.completeDailyChallenge(user.id, { ...input, response: "Updated response" });
+    await local.completeDailyChallenge(user.id, input);
+    await local.completeDailyChallenge(user.id, { ...input, response: "Updated response" });
 
-    const completion = local.getChallengeCompletion(user.id, input.challengeDate);
+    const completion = await local.getChallengeCompletion(user.id, input.challengeDate);
     expect(completion?.response).toBe("Updated response");
     expect(
-      local.getProgressOverview(user.id).recentActivity.filter(item => item.kind === "challenge")
+      (await local.getProgressOverview(user.id)).recentActivity.filter(
+        item => item.kind === "challenge"
+      )
     ).toHaveLength(1);
   });
 });

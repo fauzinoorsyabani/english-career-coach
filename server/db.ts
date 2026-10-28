@@ -1,4 +1,4 @@
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, lte, ne } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import { nanoid } from "nanoid";
 import {
@@ -9,9 +9,11 @@ import {
   scenarioCompletions,
   tutorConversations,
   tutorMessages,
+  userSessions,
   users,
   vocabularyFlashcards,
 } from "../drizzle/schema";
+import type { UserSession } from "../drizzle/schema";
 import { buildProgressOverview, PracticeFeedback, PracticeType, TutorMode } from "./learning";
 import { ENV } from "./_core/env";
 import * as localData from "./localData";
@@ -20,15 +22,18 @@ let _db: ReturnType<typeof drizzle> | null = null;
 
 /**
  * Local mode keeps the app fully usable without external credentials. It is
- * enabled by `LOCAL_DATA=true`, or automatically outside production when no
- * MySQL `DATABASE_URL` is configured. Vercel production still requires a real
- * database, so a missing URL there fails loudly instead of silently writing to
- * an ephemeral filesystem.
+ * enabled by `LOCAL_DATA=true`, automatically outside production when no MySQL
+ * `DATABASE_URL` is configured, or in production when Upstash Redis is attached.
+ * Redis keeps the JSON document durable across serverless instances; a missing
+ * database or Redis store still fails loudly instead of silently writing to an
+ * ephemeral filesystem.
  */
 function usesLocalData() {
   return (
     !process.env.DATABASE_URL &&
-    (process.env.LOCAL_DATA === "true" || process.env.NODE_ENV !== "production")
+    (process.env.LOCAL_DATA === "true" ||
+      process.env.NODE_ENV !== "production" ||
+      localData.usesRedisStorage())
   );
 }
 
@@ -53,19 +58,23 @@ async function requireDb() {
 export async function upsertUser(user: InsertUser): Promise<void> {
   if (!user.openId) throw new Error("User openId is required for upsert");
   if (usesLocalData()) {
-    localData.upsertUser(user);
+    await localData.upsertUser(user);
     return;
   }
   const db = await getDb();
   if (!db) return;
   const values: InsertUser = { openId: user.openId, lastSignedIn: user.lastSignedIn ?? new Date() };
   const updateSet: Record<string, unknown> = { lastSignedIn: values.lastSignedIn };
-  (["name", "email", "loginMethod"] as const).forEach(field => {
+  (["name", "email", "passwordHash", "loginMethod"] as const).forEach(field => {
     if (user[field] !== undefined) {
       values[field] = user[field] ?? null;
       updateSet[field] = user[field] ?? null;
     }
   });
+  if (user.status !== undefined) {
+    values.status = user.status;
+    updateSet.status = user.status;
+  }
   if (user.role !== undefined) {
     values.role = user.role;
     updateSet.role = user.role;
@@ -82,6 +91,188 @@ export async function getUserByOpenId(openId: string) {
   if (!db) return undefined;
   const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
   return result[0];
+}
+
+export async function getUserById(id: number) {
+  if (usesLocalData()) return localData.getUserById(id);
+  const db = await getDb();
+  if (!db) return undefined;
+  const result = await db.select().from(users).where(eq(users.id, id)).limit(1);
+  return result[0];
+}
+
+export async function getUserByEmail(email: string) {
+  if (usesLocalData()) return localData.getUserByEmail(email);
+  const db = await getDb();
+  if (!db) return undefined;
+  const result = await db
+    .select()
+    .from(users)
+    .where(eq(users.email, email.trim().toLowerCase()))
+    .limit(1);
+  return result[0];
+}
+
+export async function updateUserAccount(userId: number, values: { name: string; email: string }) {
+  if (usesLocalData()) return localData.updateUserAccount(userId, values);
+  const db = await requireDb();
+  const email = values.email.trim().toLowerCase();
+  const existing = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.email, email))
+    .limit(1);
+  if (existing[0] && existing[0].id !== userId) {
+    throw new Error("That email address is already in use.");
+  }
+  await db
+    .update(users)
+    .set({ name: values.name.trim(), email })
+    .where(eq(users.id, userId));
+  return getUserById(userId);
+}
+
+export async function updateUserPassword(userId: number, passwordHash: string) {
+  if (usesLocalData()) return localData.updateUserPassword(userId, passwordHash);
+  const db = await requireDb();
+  await db.update(users).set({ passwordHash }).where(eq(users.id, userId));
+  return getUserById(userId);
+}
+
+export async function deleteUserAccount(userId: number) {
+  if (usesLocalData()) return localData.deleteUserAccount(userId);
+  const db = await requireDb();
+  await db.delete(userSessions).where(eq(userSessions.userId, userId));
+  await db.delete(tutorMessages).where(eq(tutorMessages.userId, userId));
+  await db.delete(tutorConversations).where(eq(tutorConversations.userId, userId));
+  await db.delete(learnerProfiles).where(eq(learnerProfiles.userId, userId));
+  await db.delete(practiceAttempts).where(eq(practiceAttempts.userId, userId));
+  await db.delete(scenarioCompletions).where(eq(scenarioCompletions.userId, userId));
+  await db.delete(vocabularyFlashcards).where(eq(vocabularyFlashcards.userId, userId));
+  await db.delete(dailyChallengeCompletions).where(eq(dailyChallengeCompletions.userId, userId));
+  await db.delete(users).where(eq(users.id, userId));
+  return true;
+}
+
+export async function createSession(session: UserSession) {
+  if (usesLocalData()) return localData.createSession(session);
+  const db = await requireDb();
+  await db.delete(userSessions).where(lte(userSessions.expiresAt, new Date()));
+  await db.insert(userSessions).values(session);
+  return session;
+}
+
+export async function getSession(sessionId: string) {
+  if (usesLocalData()) return localData.getSession(sessionId);
+  const db = await getDb();
+  if (!db) return undefined;
+  const result = await db
+    .select()
+    .from(userSessions)
+    .where(eq(userSessions.id, sessionId))
+    .limit(1);
+  const session = result[0];
+  if (!session || session.expiresAt.getTime() <= Date.now()) return undefined;
+  return session;
+}
+
+export async function listSessions(userId: number) {
+  if (usesLocalData()) return localData.listSessions(userId);
+  const db = await requireDb();
+  const rows = await db
+    .select()
+    .from(userSessions)
+    .where(eq(userSessions.userId, userId))
+    .orderBy(desc(userSessions.lastSeenAt));
+  return rows.filter(session => session.expiresAt.getTime() > Date.now());
+}
+
+export async function touchSession(sessionId: string, lastSeenAt: Date) {
+  if (usesLocalData()) return localData.touchSession(sessionId, lastSeenAt);
+  const db = await getDb();
+  if (!db) return;
+  await db
+    .update(userSessions)
+    .set({ lastSeenAt })
+    .where(eq(userSessions.id, sessionId));
+}
+
+export async function revokeSession(userId: number, sessionId: string) {
+  if (usesLocalData()) return localData.revokeSession(userId, sessionId);
+  const db = await requireDb();
+  await db
+    .delete(userSessions)
+    .where(and(eq(userSessions.userId, userId), eq(userSessions.id, sessionId)));
+  return true;
+}
+
+export async function revokeOtherSessions(userId: number, keepSessionId?: string) {
+  if (usesLocalData()) return localData.revokeOtherSessions(userId, keepSessionId);
+  const db = await requireDb();
+  await db
+    .delete(userSessions)
+    .where(
+      keepSessionId
+        ? and(eq(userSessions.userId, userId), ne(userSessions.id, keepSessionId))
+        : eq(userSessions.userId, userId)
+    );
+  return true;
+}
+
+export async function revokeAllSessions(userId: number) {
+  if (usesLocalData()) return localData.revokeAllSessions(userId);
+  const db = await requireDb();
+  await db.delete(userSessions).where(eq(userSessions.userId, userId));
+  return true;
+}
+
+export async function countPasswordAccounts() {
+  if (usesLocalData()) return localData.countPasswordAccounts();
+  const db = await requireDb();
+  const rows = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.loginMethod, "password"));
+  return rows.length;
+}
+
+export async function listAllUsers() {
+  if (usesLocalData()) return localData.listAllUsers();
+  const db = await requireDb();
+  return db.select().from(users).orderBy(desc(users.createdAt));
+}
+
+export async function countActiveAdmins() {
+  if (usesLocalData()) return localData.countActiveAdmins();
+  const db = await requireDb();
+  const rows = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.role, "admin"), eq(users.status, "active")));
+  return rows.length;
+}
+
+export async function updateUserModeration(
+  userId: number,
+  values: { role?: "user" | "admin"; status?: "active" | "disabled" }
+) {
+  if (usesLocalData()) return localData.updateUserModeration(userId, values);
+  const db = await requireDb();
+  const updateSet: { role?: "user" | "admin"; status?: "active" | "disabled" } = {};
+  if (values.role !== undefined) updateSet.role = values.role;
+  if (values.status !== undefined) updateSet.status = values.status;
+  await db.update(users).set(updateSet).where(eq(users.id, userId));
+  return getUserById(userId);
+}
+
+export async function countActiveSessions(userId: number) {
+  if (usesLocalData()) return localData.countActiveSessions(userId);
+  const db = await requireDb();
+  const rows = await db
+    .select({ id: userSessions.id, expiresAt: userSessions.expiresAt })
+    .from(userSessions)
+    .where(eq(userSessions.userId, userId));
+  return rows.filter(row => row.expiresAt.getTime() > Date.now()).length;
 }
 
 export async function getProfile(userId: number) {

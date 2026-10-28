@@ -2,30 +2,8 @@
 import express from "express";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 
-// shared/const.ts
-var COOKIE_NAME = "app_session_id";
-var ONE_YEAR_MS = 1e3 * 60 * 60 * 24 * 365;
-var AXIOS_TIMEOUT_MS = 3e4;
-var UNAUTHED_ERR_MSG = "Please login (10001)";
-var NOT_ADMIN_ERR_MSG = "You do not have required permission (10002)";
-var OAUTH_STATE_COOKIE = "__Host-oauth_state";
-var decodeOAuthState = (state2) => {
-  let decoded;
-  try {
-    decoded = atob(state2);
-  } catch {
-    return { redirectUri: "" };
-  }
-  try {
-    const parsed = JSON.parse(decoded);
-    if (parsed && typeof parsed.redirectUri === "string") return parsed;
-  } catch {
-  }
-  return { redirectUri: decoded };
-};
-
 // server/db.ts
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, lte, ne } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import { nanoid as nanoid2 } from "nanoid";
 
@@ -46,12 +24,30 @@ var users = mysqlTable("users", {
   openId: varchar("openId", { length: 64 }).notNull().unique(),
   name: text("name"),
   email: varchar("email", { length: 320 }),
+  passwordHash: varchar("passwordHash", { length: 255 }),
   loginMethod: varchar("loginMethod", { length: 64 }),
   role: mysqlEnum("role", ["user", "admin"]).default("user").notNull(),
+  status: mysqlEnum("status", ["active", "disabled"]).default("active").notNull(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
   lastSignedIn: timestamp("lastSignedIn").defaultNow().notNull()
 });
+var userSessions = mysqlTable(
+  "user_sessions",
+  {
+    id: varchar("id", { length: 64 }).primaryKey(),
+    userId: int("userId").notNull(),
+    userAgent: text("userAgent"),
+    ipAddress: varchar("ipAddress", { length: 64 }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    lastSeenAt: timestamp("lastSeenAt").defaultNow().notNull(),
+    expiresAt: timestamp("expiresAt").notNull()
+  },
+  (table) => ({
+    userSeen: index("session_user_seen_idx").on(table.userId, table.lastSeenAt),
+    expires: index("session_expires_idx").on(table.expiresAt)
+  })
+);
 var learnerProfiles = mysqlTable(
   "learner_profiles",
   {
@@ -389,15 +385,44 @@ var ENV = {
 // server/localData.ts
 import fs from "node:fs";
 import path from "node:path";
+import { Redis } from "@upstash/redis";
 import { nanoid } from "nanoid";
 var DEFAULT_FILE = path.resolve(process.cwd(), ".data", "local-db.json");
 var dataFile = () => process.env.LOCAL_DATA_FILE?.trim() || DEFAULT_FILE;
-var state = null;
+var REDIS_URL = process.env.KV_REST_API_URL ?? process.env.UPSTASH_REDIS_REST_URL ?? "";
+var REDIS_TOKEN = process.env.KV_REST_API_TOKEN ?? process.env.UPSTASH_REDIS_REST_TOKEN ?? "";
+var REDIS_NAMESPACE = process.env.LOCAL_DATA_REDIS_PREFIX?.trim() || `english-career-coach:${process.env.VERCEL_ENV ?? "local"}`;
+var STATE_KEY = `${REDIS_NAMESPACE}:state`;
+var LOCK_KEY = `${REDIS_NAMESPACE}:lock`;
+var LOCK_TTL_MS = 2e4;
+var LOCK_TIMEOUT_MS = 1e4;
+function usesRedisStorage() {
+  if (process.env.LOCAL_DATA === "file") return false;
+  if (process.env.LOCAL_DATA === "redis") return true;
+  return Boolean(REDIS_URL && REDIS_TOKEN) && process.env.NODE_ENV === "production";
+}
+function getStorageMode() {
+  return usesRedisStorage() ? "redis" : "file";
+}
+var redisClient = null;
+function getRedis() {
+  if (!REDIS_URL || !REDIS_TOKEN) {
+    throw new Error(
+      "Redis is not configured. Set KV_REST_API_URL and KV_REST_API_TOKEN, or use LOCAL_DATA=file."
+    );
+  }
+  if (!redisClient) {
+    redisClient = new Redis({ url: REDIS_URL, token: REDIS_TOKEN });
+  }
+  return redisClient;
+}
+var fileState = null;
 function emptyState() {
   return {
-    version: 1,
+    version: 2,
     nextUserId: 1,
     users: [],
+    userSessions: [],
     learnerProfiles: [],
     tutorConversations: [],
     tutorMessages: [],
@@ -408,64 +433,75 @@ function emptyState() {
   };
 }
 var asDate = (value) => value == null ? value : value instanceof Date ? value : new Date(value);
-function loadState() {
-  if (state) return state;
+function normalizeState(raw) {
+  return {
+    ...emptyState(),
+    ...raw,
+    version: 2,
+    users: (raw.users ?? []).map((user) => ({
+      ...user,
+      passwordHash: user.passwordHash ?? null,
+      status: user.status ?? "active",
+      createdAt: asDate(user.createdAt),
+      updatedAt: asDate(user.updatedAt),
+      lastSignedIn: asDate(user.lastSignedIn)
+    })),
+    userSessions: (raw.userSessions ?? []).map((session) => ({
+      ...session,
+      createdAt: asDate(session.createdAt),
+      lastSeenAt: asDate(session.lastSeenAt),
+      expiresAt: asDate(session.expiresAt)
+    })),
+    learnerProfiles: (raw.learnerProfiles ?? []).map((profile) => ({
+      ...profile,
+      createdAt: asDate(profile.createdAt),
+      updatedAt: asDate(profile.updatedAt)
+    })),
+    tutorConversations: (raw.tutorConversations ?? []).map((conversation) => ({
+      ...conversation,
+      createdAt: asDate(conversation.createdAt),
+      updatedAt: asDate(conversation.updatedAt)
+    })),
+    tutorMessages: (raw.tutorMessages ?? []).map((message) => ({
+      ...message,
+      createdAt: asDate(message.createdAt)
+    })),
+    practiceAttempts: (raw.practiceAttempts ?? []).map((attempt) => ({
+      ...attempt,
+      completedAt: asDate(attempt.completedAt)
+    })),
+    scenarioCompletions: (raw.scenarioCompletions ?? []).map((completion) => ({
+      ...completion,
+      completedAt: asDate(completion.completedAt)
+    })),
+    vocabularyFlashcards: (raw.vocabularyFlashcards ?? []).map((card) => ({
+      ...card,
+      createdAt: asDate(card.createdAt),
+      reviewedAt: asDate(card.reviewedAt) ?? null
+    })),
+    dailyChallengeCompletions: (raw.dailyChallengeCompletions ?? []).map((completion) => ({
+      ...completion,
+      completedAt: asDate(completion.completedAt)
+    }))
+  };
+}
+function loadFileState() {
+  if (fileState) return fileState;
   const file = dataFile();
   try {
     if (fs.existsSync(file)) {
       const raw = JSON.parse(fs.readFileSync(file, "utf8"));
-      state = {
-        ...emptyState(),
-        ...raw,
-        version: 1,
-        users: (raw.users ?? []).map((user) => ({
-          ...user,
-          createdAt: asDate(user.createdAt),
-          updatedAt: asDate(user.updatedAt),
-          lastSignedIn: asDate(user.lastSignedIn)
-        })),
-        learnerProfiles: (raw.learnerProfiles ?? []).map((profile) => ({
-          ...profile,
-          createdAt: asDate(profile.createdAt),
-          updatedAt: asDate(profile.updatedAt)
-        })),
-        tutorConversations: (raw.tutorConversations ?? []).map((conversation) => ({
-          ...conversation,
-          createdAt: asDate(conversation.createdAt),
-          updatedAt: asDate(conversation.updatedAt)
-        })),
-        tutorMessages: (raw.tutorMessages ?? []).map((message) => ({
-          ...message,
-          createdAt: asDate(message.createdAt)
-        })),
-        practiceAttempts: (raw.practiceAttempts ?? []).map((attempt) => ({
-          ...attempt,
-          completedAt: asDate(attempt.completedAt)
-        })),
-        scenarioCompletions: (raw.scenarioCompletions ?? []).map((completion) => ({
-          ...completion,
-          completedAt: asDate(completion.completedAt)
-        })),
-        vocabularyFlashcards: (raw.vocabularyFlashcards ?? []).map((card) => ({
-          ...card,
-          createdAt: asDate(card.createdAt),
-          reviewedAt: asDate(card.reviewedAt) ?? null
-        })),
-        dailyChallengeCompletions: (raw.dailyChallengeCompletions ?? []).map((completion) => ({
-          ...completion,
-          completedAt: asDate(completion.completedAt)
-        }))
-      };
-      return state;
+      fileState = normalizeState(raw);
+      return fileState;
     }
   } catch (error) {
     console.warn("[LocalData] Could not read local database, starting fresh:", error);
   }
-  state = emptyState();
-  return state;
+  fileState = emptyState();
+  return fileState;
 }
-function saveState() {
-  const current = loadState();
+function saveFileState() {
+  const current = loadFileState();
   const file = dataFile();
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -476,43 +512,64 @@ function saveState() {
     console.error("[LocalData] Failed to save local database:", error);
   }
 }
-function upsertUser(user) {
-  if (!user.openId) throw new Error("User openId is required for upsert");
-  const current = loadState();
-  const now = /* @__PURE__ */ new Date();
-  const existing = current.users.find((item) => item.openId === user.openId);
-  if (existing) {
-    if (user.name !== void 0) existing.name = user.name ?? null;
-    if (user.email !== void 0) existing.email = user.email ?? null;
-    if (user.loginMethod !== void 0) existing.loginMethod = user.loginMethod ?? null;
-    if (user.role !== void 0) existing.role = user.role;
-    existing.lastSignedIn = user.lastSignedIn ?? now;
-    existing.updatedAt = now;
-    saveState();
-    return existing;
+async function loadRedisState() {
+  const raw = await getRedis().get(STATE_KEY);
+  if (!raw) return emptyState();
+  return normalizeState(raw);
+}
+async function readState() {
+  if (usesRedisStorage()) return loadRedisState();
+  return loadFileState();
+}
+var RELEASE_LOCK_SCRIPT = `
+if redis.call("get", KEYS[1]) == ARGV[1] then
+  return redis.call("del", KEYS[1])
+end
+return 0
+`;
+async function withRedisLock(work) {
+  const redis = getRedis();
+  const token = nanoid(24);
+  const startedAt = Date.now();
+  let acquired = false;
+  while (!acquired) {
+    const result = await redis.set(LOCK_KEY, token, { nx: true, px: LOCK_TTL_MS });
+    if (result === "OK") {
+      acquired = true;
+      break;
+    }
+    if (Date.now() - startedAt >= LOCK_TIMEOUT_MS) {
+      throw new Error("The database is busy. Please try again.");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 35 + Math.floor(Math.random() * 60)));
   }
-  const created = {
-    id: current.nextUserId++,
-    openId: user.openId,
-    name: user.name ?? null,
-    email: user.email ?? null,
-    loginMethod: user.loginMethod ?? null,
-    role: user.role ?? "user",
-    createdAt: now,
-    updatedAt: now,
-    lastSignedIn: user.lastSignedIn ?? now
-  };
-  current.users.push(created);
-  saveState();
-  return created;
+  try {
+    return await work();
+  } finally {
+    try {
+      await redis.eval(RELEASE_LOCK_SCRIPT, [LOCK_KEY], [token]);
+    } catch (error) {
+      console.warn("[LocalData] Could not release the Redis lock:", error);
+    }
+  }
 }
-function getUserByOpenId(openId) {
-  return loadState().users.find((user) => user.openId === openId);
+async function transaction(work) {
+  if (usesRedisStorage()) {
+    return withRedisLock(async () => {
+      const state2 = await loadRedisState();
+      const { result: result2, changed: changed2 } = work(state2);
+      if (changed2) await getRedis().set(STATE_KEY, state2);
+      return result2;
+    });
+  }
+  const state = loadFileState();
+  const { result, changed } = work(state);
+  if (changed) saveFileState();
+  return result;
 }
-function getProfile(userId) {
-  const current = loadState();
-  const existing = current.learnerProfiles.find((profile2) => profile2.userId === userId);
-  if (existing) return existing;
+function ensureProfile(state, userId) {
+  const existing = state.learnerProfiles.find((profile2) => profile2.userId === userId);
+  if (existing) return { profile: existing, created: false };
   const now = /* @__PURE__ */ new Date();
   const profile = {
     id: nanoid(),
@@ -524,31 +581,211 @@ function getProfile(userId) {
     createdAt: now,
     updatedAt: now
   };
-  current.learnerProfiles.push(profile);
-  saveState();
-  return profile;
+  state.learnerProfiles.push(profile);
+  return { profile, created: true };
 }
-function updateProfile(userId, values) {
-  const current = loadState();
-  const profile = getProfile(userId);
-  Object.assign(profile, values, { updatedAt: /* @__PURE__ */ new Date() });
-  if (!current.learnerProfiles.includes(profile)) current.learnerProfiles.push(profile);
-  saveState();
-  return profile;
+async function upsertUser(user) {
+  if (!user.openId) throw new Error("User openId is required for upsert");
+  return transaction((state) => {
+    const now = /* @__PURE__ */ new Date();
+    const existing = state.users.find((item) => item.openId === user.openId);
+    if (existing) {
+      if (user.name !== void 0) existing.name = user.name ?? null;
+      if (user.email !== void 0) existing.email = user.email ?? null;
+      if (user.passwordHash !== void 0) existing.passwordHash = user.passwordHash ?? null;
+      if (user.loginMethod !== void 0) existing.loginMethod = user.loginMethod ?? null;
+      if (user.role !== void 0) existing.role = user.role;
+      if (user.status !== void 0) existing.status = user.status;
+      existing.lastSignedIn = user.lastSignedIn ?? now;
+      existing.updatedAt = now;
+      return { result: existing, changed: true };
+    }
+    const created = {
+      id: state.nextUserId++,
+      openId: user.openId,
+      name: user.name ?? null,
+      email: user.email ?? null,
+      passwordHash: user.passwordHash ?? null,
+      loginMethod: user.loginMethod ?? null,
+      role: user.role ?? "user",
+      status: user.status ?? "active",
+      createdAt: now,
+      updatedAt: now,
+      lastSignedIn: user.lastSignedIn ?? now
+    };
+    state.users.push(created);
+    return { result: created, changed: true };
+  });
 }
-function listConversations(userId) {
-  return loadState().tutorConversations.filter((conversation) => conversation.userId === userId).sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime()).slice(0, 30);
+async function getUserByOpenId(openId) {
+  return (await readState()).users.find((user) => user.openId === openId);
 }
-function getConversation(userId, conversationId) {
-  const current = loadState();
-  const conversation = current.tutorConversations.find(
+async function getUserById(id) {
+  return (await readState()).users.find((user) => user.id === id);
+}
+async function getUserByEmail(email) {
+  const normalized = email.trim().toLowerCase();
+  return (await readState()).users.find(
+    (user) => user.email?.trim().toLowerCase() === normalized
+  );
+}
+async function updateUserAccount(userId, values) {
+  return transaction((state) => {
+    const user = state.users.find((item) => item.id === userId);
+    if (!user) return { result: void 0, changed: false };
+    const email = values.email.trim().toLowerCase();
+    const duplicate = state.users.find(
+      (item) => item.id !== userId && item.email?.trim().toLowerCase() === email
+    );
+    if (duplicate) throw new Error("That email address is already in use.");
+    user.name = values.name.trim();
+    user.email = email;
+    user.updatedAt = /* @__PURE__ */ new Date();
+    return { result: user, changed: true };
+  });
+}
+async function updateUserPassword(userId, passwordHash) {
+  return transaction((state) => {
+    const user = state.users.find((item) => item.id === userId);
+    if (!user) return { result: void 0, changed: false };
+    user.passwordHash = passwordHash;
+    user.updatedAt = /* @__PURE__ */ new Date();
+    return { result: user, changed: true };
+  });
+}
+async function deleteUserAccount(userId) {
+  return transaction((state) => {
+    const exists = state.users.some((user) => user.id === userId);
+    if (!exists) return { result: false, changed: false };
+    state.users = state.users.filter((user) => user.id !== userId);
+    state.userSessions = state.userSessions.filter((session) => session.userId !== userId);
+    state.learnerProfiles = state.learnerProfiles.filter((profile) => profile.userId !== userId);
+    const conversationIds = new Set(
+      state.tutorConversations.filter((conversation) => conversation.userId === userId).map((conversation) => conversation.id)
+    );
+    state.tutorConversations = state.tutorConversations.filter(
+      (conversation) => conversation.userId !== userId
+    );
+    state.tutorMessages = state.tutorMessages.filter(
+      (message) => message.userId !== userId && !conversationIds.has(message.conversationId)
+    );
+    state.practiceAttempts = state.practiceAttempts.filter((attempt) => attempt.userId !== userId);
+    state.scenarioCompletions = state.scenarioCompletions.filter(
+      (completion) => completion.userId !== userId
+    );
+    state.vocabularyFlashcards = state.vocabularyFlashcards.filter(
+      (card) => card.userId !== userId
+    );
+    state.dailyChallengeCompletions = state.dailyChallengeCompletions.filter(
+      (completion) => completion.userId !== userId
+    );
+    return { result: true, changed: true };
+  });
+}
+async function countPasswordAccounts() {
+  return (await readState()).users.filter((user) => user.loginMethod === "password").length;
+}
+async function listAllUsers() {
+  return [...(await readState()).users].sort(
+    (a, b) => b.createdAt.getTime() - a.createdAt.getTime()
+  );
+}
+async function countActiveAdmins() {
+  return (await readState()).users.filter(
+    (user) => user.role === "admin" && user.status === "active"
+  ).length;
+}
+async function updateUserModeration(userId, values) {
+  return transaction((state) => {
+    const user = state.users.find((item) => item.id === userId);
+    if (!user) return { result: void 0, changed: false };
+    if (values.role !== void 0) user.role = values.role;
+    if (values.status !== void 0) user.status = values.status;
+    user.updatedAt = /* @__PURE__ */ new Date();
+    return { result: user, changed: true };
+  });
+}
+async function countActiveSessions(userId) {
+  return (await listSessions(userId)).length;
+}
+async function createSession(session) {
+  return transaction((state) => {
+    const now = Date.now();
+    state.userSessions = state.userSessions.filter(
+      (item) => item.expiresAt.getTime() > now
+    );
+    state.userSessions.push(session);
+    return { result: session, changed: true };
+  });
+}
+async function getSession(sessionId) {
+  const session = (await readState()).userSessions.find((item) => item.id === sessionId);
+  if (!session) return void 0;
+  if (session.expiresAt.getTime() <= Date.now()) return void 0;
+  return session;
+}
+async function listSessions(userId) {
+  return (await readState()).userSessions.filter(
+    (session) => session.userId === userId && session.expiresAt.getTime() > Date.now()
+  ).sort((a, b) => b.lastSeenAt.getTime() - a.lastSeenAt.getTime());
+}
+async function touchSession(sessionId, lastSeenAt) {
+  return transaction((state) => {
+    const session = state.userSessions.find((item) => item.id === sessionId);
+    if (!session) return { result: void 0, changed: false };
+    session.lastSeenAt = lastSeenAt;
+    return { result: session, changed: true };
+  });
+}
+async function revokeSession(userId, sessionId) {
+  return transaction((state) => {
+    const before = state.userSessions.length;
+    state.userSessions = state.userSessions.filter(
+      (session) => !(session.id === sessionId && session.userId === userId)
+    );
+    const removed = state.userSessions.length !== before;
+    return { result: removed, changed: removed };
+  });
+}
+async function revokeOtherSessions(userId, keepSessionId) {
+  return transaction((state) => {
+    const before = state.userSessions.length;
+    state.userSessions = state.userSessions.filter(
+      (session) => session.userId !== userId || keepSessionId !== void 0 && session.id === keepSessionId
+    );
+    const removed = before - state.userSessions.length;
+    return { result: removed, changed: removed > 0 };
+  });
+}
+async function revokeAllSessions(userId) {
+  return revokeOtherSessions(userId);
+}
+async function getProfile(userId) {
+  return transaction((state) => {
+    const { profile, created } = ensureProfile(state, userId);
+    return { result: profile, changed: created };
+  });
+}
+async function updateProfile(userId, values) {
+  return transaction((state) => {
+    const { profile } = ensureProfile(state, userId);
+    Object.assign(profile, values, { updatedAt: /* @__PURE__ */ new Date() });
+    return { result: profile, changed: true };
+  });
+}
+async function listConversations(userId) {
+  return (await readState()).tutorConversations.filter((conversation) => conversation.userId === userId).sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime()).slice(0, 30);
+}
+async function getConversation(userId, conversationId) {
+  const state = await readState();
+  const conversation = state.tutorConversations.find(
     (item) => item.id === conversationId && item.userId === userId
   );
   if (!conversation) return void 0;
-  const messages = current.tutorMessages.filter((message) => message.conversationId === conversationId && message.userId === userId).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  const messages = state.tutorMessages.filter((message) => message.conversationId === conversationId && message.userId === userId).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
   return { conversation, messages };
 }
-function createConversation(userId, mode, title, scenarioSlug) {
+async function createConversation(userId, mode, title, scenarioSlug) {
   const now = /* @__PURE__ */ new Date();
   const conversation = {
     id: nanoid(),
@@ -559,12 +796,12 @@ function createConversation(userId, mode, title, scenarioSlug) {
     createdAt: now,
     updatedAt: now
   };
-  loadState().tutorConversations.push(conversation);
-  saveState();
-  return conversation;
+  return transaction((state) => {
+    state.tutorConversations.push(conversation);
+    return { result: conversation, changed: true };
+  });
 }
-function addMessage(userId, conversationId, role, content) {
-  const current = loadState();
+async function addMessage(userId, conversationId, role, content) {
   const message = {
     id: nanoid(),
     conversationId,
@@ -573,15 +810,16 @@ function addMessage(userId, conversationId, role, content) {
     content,
     createdAt: /* @__PURE__ */ new Date()
   };
-  current.tutorMessages.push(message);
-  const conversation = current.tutorConversations.find(
-    (item) => item.id === conversationId && item.userId === userId
-  );
-  if (conversation) conversation.updatedAt = /* @__PURE__ */ new Date();
-  saveState();
-  return message;
+  return transaction((state) => {
+    state.tutorMessages.push(message);
+    const conversation = state.tutorConversations.find(
+      (item) => item.id === conversationId && item.userId === userId
+    );
+    if (conversation) conversation.updatedAt = /* @__PURE__ */ new Date();
+    return { result: message, changed: true };
+  });
 }
-function savePracticeAttempt(userId, input) {
+async function savePracticeAttempt(userId, input) {
   const attempt = {
     id: nanoid(),
     userId,
@@ -598,119 +836,127 @@ function savePracticeAttempt(userId, input) {
     },
     completedAt: /* @__PURE__ */ new Date()
   };
-  loadState().practiceAttempts.push(attempt);
-  saveState();
-  return attempt;
+  return transaction((state) => {
+    state.practiceAttempts.push(attempt);
+    return { result: attempt, changed: true };
+  });
 }
-function getScenarioCompletions(userId) {
-  return loadState().scenarioCompletions.filter((completion) => completion.userId === userId);
-}
-function completeScenario(userId, scenarioSlug, conversationId) {
-  const current = loadState();
-  const now = /* @__PURE__ */ new Date();
-  const existing = current.scenarioCompletions.find(
-    (completion2) => completion2.userId === userId && completion2.scenarioSlug === scenarioSlug
+async function getScenarioCompletions(userId) {
+  return (await readState()).scenarioCompletions.filter(
+    (completion) => completion.userId === userId
   );
-  if (existing) {
-    existing.conversationId = conversationId ?? null;
-    existing.completedAt = now;
-    saveState();
-    return existing;
-  }
-  const completion = {
-    id: nanoid(),
-    userId,
-    scenarioSlug,
-    conversationId: conversationId ?? null,
-    completedAt: now
-  };
-  current.scenarioCompletions.push(completion);
-  saveState();
-  return completion;
 }
-function listFlashcards(userId) {
-  return loadState().vocabularyFlashcards.filter((card) => card.userId === userId).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+async function completeScenario(userId, scenarioSlug, conversationId) {
+  return transaction((state) => {
+    const now = /* @__PURE__ */ new Date();
+    const existing = state.scenarioCompletions.find(
+      (completion2) => completion2.userId === userId && completion2.scenarioSlug === scenarioSlug
+    );
+    if (existing) {
+      existing.conversationId = conversationId ?? null;
+      existing.completedAt = now;
+      return { result: existing, changed: true };
+    }
+    const completion = {
+      id: nanoid(),
+      userId,
+      scenarioSlug,
+      conversationId: conversationId ?? null,
+      completedAt: now
+    };
+    state.scenarioCompletions.push(completion);
+    return { result: completion, changed: true };
+  });
 }
-function saveFlashcard(userId, input) {
-  const current = loadState();
-  const normalised = input.term.trim().toLowerCase();
-  const existing = current.vocabularyFlashcards.find(
-    (card2) => card2.userId === userId && card2.term.trim().toLowerCase() === normalised
-  );
-  if (existing) {
-    existing.definition = input.definition;
-    existing.example = input.example;
-    existing.sourceConversationId = input.sourceConversationId ?? null;
-    saveState();
-    return existing;
-  }
-  const card = {
-    id: nanoid(),
-    userId,
-    term: input.term,
-    definition: input.definition,
-    example: input.example,
-    sourceConversationId: input.sourceConversationId ?? null,
-    createdAt: /* @__PURE__ */ new Date(),
-    reviewedAt: null
-  };
-  current.vocabularyFlashcards.push(card);
-  saveState();
-  return card;
+async function listFlashcards(userId) {
+  return (await readState()).vocabularyFlashcards.filter((card) => card.userId === userId).sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
 }
-function markFlashcardReviewed(userId, flashcardId) {
-  const card = loadState().vocabularyFlashcards.find(
-    (item) => item.id === flashcardId && item.userId === userId
-  );
-  if (!card) return;
-  card.reviewedAt = /* @__PURE__ */ new Date();
-  saveState();
+async function saveFlashcard(userId, input) {
+  return transaction((state) => {
+    const normalised = input.term.trim().toLowerCase();
+    const existing = state.vocabularyFlashcards.find(
+      (card2) => card2.userId === userId && card2.term.trim().toLowerCase() === normalised
+    );
+    if (existing) {
+      existing.definition = input.definition;
+      existing.example = input.example;
+      existing.sourceConversationId = input.sourceConversationId ?? null;
+      return { result: existing, changed: true };
+    }
+    const card = {
+      id: nanoid(),
+      userId,
+      term: input.term,
+      definition: input.definition,
+      example: input.example,
+      sourceConversationId: input.sourceConversationId ?? null,
+      createdAt: /* @__PURE__ */ new Date(),
+      reviewedAt: null
+    };
+    state.vocabularyFlashcards.push(card);
+    return { result: card, changed: true };
+  });
 }
-function getChallengeCompletion(userId, challengeDate) {
-  return loadState().dailyChallengeCompletions.find(
+async function markFlashcardReviewed(userId, flashcardId) {
+  return transaction((state) => {
+    const card = state.vocabularyFlashcards.find(
+      (item) => item.id === flashcardId && item.userId === userId
+    );
+    if (!card) return { result: void 0, changed: false };
+    card.reviewedAt = /* @__PURE__ */ new Date();
+    return { result: card, changed: true };
+  });
+}
+async function getChallengeCompletion(userId, challengeDate) {
+  return (await readState()).dailyChallengeCompletions.find(
     (completion) => completion.userId === userId && completion.challengeDate === challengeDate
   );
 }
-function completeDailyChallenge(userId, input) {
-  const current = loadState();
-  const existing = current.dailyChallengeCompletions.find(
-    (completion2) => completion2.userId === userId && completion2.challengeDate === input.challengeDate
-  );
-  if (existing) {
-    existing.challengeId = input.challengeId;
-    existing.response = input.response;
-    existing.completedAt = /* @__PURE__ */ new Date();
-    saveState();
-    return existing;
-  }
-  const completion = {
-    id: nanoid(),
-    userId,
-    challengeDate: input.challengeDate,
-    challengeId: input.challengeId,
-    response: input.response,
-    completedAt: /* @__PURE__ */ new Date()
-  };
-  current.dailyChallengeCompletions.push(completion);
-  saveState();
-  return completion;
+async function completeDailyChallenge(userId, input) {
+  return transaction((state) => {
+    const existing = state.dailyChallengeCompletions.find(
+      (completion2) => completion2.userId === userId && completion2.challengeDate === input.challengeDate
+    );
+    if (existing) {
+      existing.challengeId = input.challengeId;
+      existing.response = input.response;
+      existing.completedAt = /* @__PURE__ */ new Date();
+      return { result: existing, changed: true };
+    }
+    const completion = {
+      id: nanoid(),
+      userId,
+      challengeDate: input.challengeDate,
+      challengeId: input.challengeId,
+      response: input.response,
+      completedAt: /* @__PURE__ */ new Date()
+    };
+    state.dailyChallengeCompletions.push(completion);
+    return { result: completion, changed: true };
+  });
 }
-function getProgressOverview(userId) {
-  const current = loadState();
-  const profile = getProfile(userId);
-  return buildProgressOverview({
-    dailyGoal: profile.dailyGoal,
-    attempts: current.practiceAttempts.filter((attempt) => attempt.userId === userId),
-    completions: current.scenarioCompletions.filter((completion) => completion.userId === userId),
-    challenges: current.dailyChallengeCompletions.filter((completion) => completion.userId === userId),
-    flashcards: current.vocabularyFlashcards.filter((card) => card.userId === userId)
+async function getProgressOverview(userId) {
+  return transaction((state) => {
+    const { profile, created } = ensureProfile(state, userId);
+    const overview = buildProgressOverview({
+      dailyGoal: profile.dailyGoal,
+      attempts: state.practiceAttempts.filter((attempt) => attempt.userId === userId),
+      completions: state.scenarioCompletions.filter(
+        (completion) => completion.userId === userId
+      ),
+      challenges: state.dailyChallengeCompletions.filter(
+        (completion) => completion.userId === userId
+      ),
+      flashcards: state.vocabularyFlashcards.filter((card) => card.userId === userId)
+    });
+    return { result: overview, changed: created };
   });
 }
 
 // server/db.ts
 var _db = null;
 function usesLocalData() {
-  return !process.env.DATABASE_URL && (process.env.LOCAL_DATA === "true" || process.env.NODE_ENV !== "production");
+  return !process.env.DATABASE_URL && (process.env.LOCAL_DATA === "true" || process.env.NODE_ENV !== "production" || usesRedisStorage());
 }
 async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
@@ -731,19 +977,23 @@ async function requireDb() {
 async function upsertUser2(user) {
   if (!user.openId) throw new Error("User openId is required for upsert");
   if (usesLocalData()) {
-    upsertUser(user);
+    await upsertUser(user);
     return;
   }
   const db = await getDb();
   if (!db) return;
   const values = { openId: user.openId, lastSignedIn: user.lastSignedIn ?? /* @__PURE__ */ new Date() };
   const updateSet = { lastSignedIn: values.lastSignedIn };
-  ["name", "email", "loginMethod"].forEach((field) => {
+  ["name", "email", "passwordHash", "loginMethod"].forEach((field) => {
     if (user[field] !== void 0) {
       values[field] = user[field] ?? null;
       updateSet[field] = user[field] ?? null;
     }
   });
+  if (user.status !== void 0) {
+    values.status = user.status;
+    updateSet.status = user.status;
+  }
   if (user.role !== void 0) {
     values.role = user.role;
     updateSet.role = user.role;
@@ -759,6 +1009,131 @@ async function getUserByOpenId2(openId) {
   if (!db) return void 0;
   const result = await db.select().from(users).where(eq(users.openId, openId)).limit(1);
   return result[0];
+}
+async function getUserById2(id) {
+  if (usesLocalData()) return getUserById(id);
+  const db = await getDb();
+  if (!db) return void 0;
+  const result = await db.select().from(users).where(eq(users.id, id)).limit(1);
+  return result[0];
+}
+async function getUserByEmail2(email) {
+  if (usesLocalData()) return getUserByEmail(email);
+  const db = await getDb();
+  if (!db) return void 0;
+  const result = await db.select().from(users).where(eq(users.email, email.trim().toLowerCase())).limit(1);
+  return result[0];
+}
+async function updateUserAccount2(userId, values) {
+  if (usesLocalData()) return updateUserAccount(userId, values);
+  const db = await requireDb();
+  const email = values.email.trim().toLowerCase();
+  const existing = await db.select({ id: users.id }).from(users).where(eq(users.email, email)).limit(1);
+  if (existing[0] && existing[0].id !== userId) {
+    throw new Error("That email address is already in use.");
+  }
+  await db.update(users).set({ name: values.name.trim(), email }).where(eq(users.id, userId));
+  return getUserById2(userId);
+}
+async function updateUserPassword2(userId, passwordHash) {
+  if (usesLocalData()) return updateUserPassword(userId, passwordHash);
+  const db = await requireDb();
+  await db.update(users).set({ passwordHash }).where(eq(users.id, userId));
+  return getUserById2(userId);
+}
+async function deleteUserAccount2(userId) {
+  if (usesLocalData()) return deleteUserAccount(userId);
+  const db = await requireDb();
+  await db.delete(userSessions).where(eq(userSessions.userId, userId));
+  await db.delete(tutorMessages).where(eq(tutorMessages.userId, userId));
+  await db.delete(tutorConversations).where(eq(tutorConversations.userId, userId));
+  await db.delete(learnerProfiles).where(eq(learnerProfiles.userId, userId));
+  await db.delete(practiceAttempts).where(eq(practiceAttempts.userId, userId));
+  await db.delete(scenarioCompletions).where(eq(scenarioCompletions.userId, userId));
+  await db.delete(vocabularyFlashcards).where(eq(vocabularyFlashcards.userId, userId));
+  await db.delete(dailyChallengeCompletions).where(eq(dailyChallengeCompletions.userId, userId));
+  await db.delete(users).where(eq(users.id, userId));
+  return true;
+}
+async function createSession2(session) {
+  if (usesLocalData()) return createSession(session);
+  const db = await requireDb();
+  await db.delete(userSessions).where(lte(userSessions.expiresAt, /* @__PURE__ */ new Date()));
+  await db.insert(userSessions).values(session);
+  return session;
+}
+async function getSession2(sessionId) {
+  if (usesLocalData()) return getSession(sessionId);
+  const db = await getDb();
+  if (!db) return void 0;
+  const result = await db.select().from(userSessions).where(eq(userSessions.id, sessionId)).limit(1);
+  const session = result[0];
+  if (!session || session.expiresAt.getTime() <= Date.now()) return void 0;
+  return session;
+}
+async function listSessions2(userId) {
+  if (usesLocalData()) return listSessions(userId);
+  const db = await requireDb();
+  const rows = await db.select().from(userSessions).where(eq(userSessions.userId, userId)).orderBy(desc(userSessions.lastSeenAt));
+  return rows.filter((session) => session.expiresAt.getTime() > Date.now());
+}
+async function touchSession2(sessionId, lastSeenAt) {
+  if (usesLocalData()) return touchSession(sessionId, lastSeenAt);
+  const db = await getDb();
+  if (!db) return;
+  await db.update(userSessions).set({ lastSeenAt }).where(eq(userSessions.id, sessionId));
+}
+async function revokeSession2(userId, sessionId) {
+  if (usesLocalData()) return revokeSession(userId, sessionId);
+  const db = await requireDb();
+  await db.delete(userSessions).where(and(eq(userSessions.userId, userId), eq(userSessions.id, sessionId)));
+  return true;
+}
+async function revokeOtherSessions2(userId, keepSessionId) {
+  if (usesLocalData()) return revokeOtherSessions(userId, keepSessionId);
+  const db = await requireDb();
+  await db.delete(userSessions).where(
+    keepSessionId ? and(eq(userSessions.userId, userId), ne(userSessions.id, keepSessionId)) : eq(userSessions.userId, userId)
+  );
+  return true;
+}
+async function revokeAllSessions2(userId) {
+  if (usesLocalData()) return revokeAllSessions(userId);
+  const db = await requireDb();
+  await db.delete(userSessions).where(eq(userSessions.userId, userId));
+  return true;
+}
+async function countPasswordAccounts2() {
+  if (usesLocalData()) return countPasswordAccounts();
+  const db = await requireDb();
+  const rows = await db.select({ id: users.id }).from(users).where(eq(users.loginMethod, "password"));
+  return rows.length;
+}
+async function listAllUsers2() {
+  if (usesLocalData()) return listAllUsers();
+  const db = await requireDb();
+  return db.select().from(users).orderBy(desc(users.createdAt));
+}
+async function countActiveAdmins2() {
+  if (usesLocalData()) return countActiveAdmins();
+  const db = await requireDb();
+  const rows = await db.select({ id: users.id }).from(users).where(and(eq(users.role, "admin"), eq(users.status, "active")));
+  return rows.length;
+}
+async function updateUserModeration2(userId, values) {
+  if (usesLocalData()) return updateUserModeration(userId, values);
+  const db = await requireDb();
+  const updateSet = {};
+  if (values.role !== void 0) updateSet.role = values.role;
+  if (values.status !== void 0) updateSet.status = values.status;
+  await db.update(users).set(updateSet).where(eq(users.id, userId));
+  return getUserById2(userId);
+}
+async function countActiveSessions2(userId) {
+  if (usesLocalData()) return countActiveSessions(userId);
+  const db = await requireDb();
+  const rows = await db.select({ id: userSessions.id, expiresAt: userSessions.expiresAt }).from(userSessions).where(eq(userSessions.userId, userId));
+  return rows.filter((row) => row.expiresAt.getTime() > Date.now()).length;
 }
 async function getProfile2(userId) {
   if (usesLocalData()) return getProfile(userId);
@@ -876,6 +1251,31 @@ async function getProgressOverview2(userId) {
   });
 }
 
+// shared/const.ts
+var COOKIE_NAME = "app_session_id";
+var ONE_YEAR_MS = 1e3 * 60 * 60 * 24 * 365;
+var AXIOS_TIMEOUT_MS = 3e4;
+var UNAUTHED_ERR_MSG = "Please login (10001)";
+var NOT_ADMIN_ERR_MSG = "You do not have required permission (10002)";
+var OAUTH_STATE_COOKIE = "__Host-oauth_state";
+var decodeOAuthState = (state) => {
+  let decoded;
+  try {
+    decoded = atob(state);
+  } catch {
+    return { redirectUri: "" };
+  }
+  try {
+    const parsed = JSON.parse(decoded);
+    if (parsed && typeof parsed.redirectUri === "string") return parsed;
+  } catch {
+  }
+  return { redirectUri: decoded };
+};
+
+// server/authService.ts
+import { nanoid as nanoid3 } from "nanoid";
+
 // server/_core/cookies.ts
 function isSecureRequest(req) {
   if (req.protocol === "https") return true;
@@ -894,6 +1294,115 @@ function getSessionCookieOptions(req) {
     sameSite: secure ? "none" : "lax",
     secure
   };
+}
+
+// server/_core/password.ts
+import {
+  randomBytes,
+  scrypt as scryptCallback,
+  timingSafeEqual
+} from "node:crypto";
+var SCRYPT_N = 16384;
+var SCRYPT_R = 8;
+var SCRYPT_P = 1;
+var KEY_LENGTH = 64;
+var SALT_LENGTH = 16;
+var MAX_MEMORY = 64 * 1024 * 1024;
+var COMMON_PASSWORDS = /* @__PURE__ */ new Set([
+  "12345678",
+  "123456789",
+  "password",
+  "password1",
+  "password123",
+  "qwerty123",
+  "letmein1",
+  "iloveyou",
+  "admin123",
+  "welcome1"
+]);
+function deriveKey(password, salt, keyLength) {
+  return new Promise((resolve, reject) => {
+    scryptCallback(
+      password.normalize("NFKC"),
+      salt,
+      keyLength,
+      { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P, maxmem: MAX_MEMORY },
+      (error, derivedKey) => {
+        if (error) reject(error);
+        else resolve(derivedKey);
+      }
+    );
+  });
+}
+async function hashPassword(password) {
+  const salt = randomBytes(SALT_LENGTH);
+  const derivedKey = await deriveKey(password, salt, KEY_LENGTH);
+  return [
+    "scrypt",
+    SCRYPT_N,
+    SCRYPT_R,
+    SCRYPT_P,
+    salt.toString("base64"),
+    derivedKey.toString("base64")
+  ].join("$");
+}
+async function verifyPassword(password, storedHash) {
+  try {
+    const [scheme, n, r, p, saltValue, hashValue] = storedHash.split("$");
+    if (scheme !== "scrypt" || !saltValue || !hashValue) return false;
+    const cost = Number(n);
+    const blockSize = Number(r);
+    const parallelization = Number(p);
+    if (!Number.isInteger(cost) || !Number.isInteger(blockSize) || !Number.isInteger(parallelization) || cost < 2 || blockSize < 1 || parallelization < 1) {
+      return false;
+    }
+    const salt = Buffer.from(saltValue, "base64");
+    const expected = Buffer.from(hashValue, "base64");
+    if (salt.length === 0 || expected.length === 0) return false;
+    const derivedKey = await new Promise((resolve, reject) => {
+      scryptCallback(
+        password.normalize("NFKC"),
+        salt,
+        expected.length,
+        {
+          N: cost,
+          r: blockSize,
+          p: parallelization,
+          maxmem: MAX_MEMORY
+        },
+        (error, key) => {
+          if (error) reject(error);
+          else resolve(key);
+        }
+      );
+    });
+    if (derivedKey.length !== expected.length) return false;
+    return timingSafeEqual(derivedKey, expected);
+  } catch {
+    return false;
+  }
+}
+var dummyHash = null;
+async function verifyPasswordOrDummy(password, storedHash) {
+  if (storedHash) return verifyPassword(password, storedHash);
+  dummyHash ??= hashPassword("not-a-real-account-password");
+  await verifyPassword(password, await dummyHash);
+  return false;
+}
+function validatePassword(password) {
+  if (password.length < 8) {
+    return "Use at least 8 characters for your password.";
+  }
+  if (password.length > 128) {
+    return "Keep your password under 128 characters.";
+  }
+  if (!/[A-Za-z]/.test(password) || !/[0-9]/.test(password)) {
+    return "Include at least one letter and one number.";
+  }
+  if (COMMON_PASSWORDS.has(password.toLowerCase())) {
+    return "That password is too common. Choose something more unique.";
+  }
+  return null;
 }
 
 // shared/_core/errors.ts
@@ -928,15 +1437,15 @@ var OAuthService = class {
       );
     }
   }
-  decodeState(state2) {
-    return decodeOAuthState(state2).redirectUri;
+  decodeState(state) {
+    return decodeOAuthState(state).redirectUri;
   }
-  async getTokenByCode(code, state2) {
+  async getTokenByCode(code, state) {
     const payload = {
       clientId: ENV.appId,
       grantType: "authorization_code",
       code,
-      redirectUri: this.decodeState(state2)
+      redirectUri: this.decodeState(state)
     };
     const { data } = await this.client.post(
       EXCHANGE_TOKEN_PATH,
@@ -985,8 +1494,8 @@ var SDKServer = class {
    * @example
    * const tokenResponse = await sdk.exchangeCodeForToken(code, state);
    */
-  async exchangeCodeForToken(code, state2) {
-    return this.oauthService.getTokenByCode(code, state2);
+  async exchangeCodeForToken(code, state) {
+    return this.oauthService.getTokenByCode(code, state);
   }
   /**
    * Get user information using access token
@@ -1030,7 +1539,8 @@ var SDKServer = class {
         // Local demo sessions do not have a Manus app id, but the token still
         // needs a non-empty appId to pass verification.
         appId: ENV.appId || "local-demo",
-        name: options.name || ""
+        name: options.name || "",
+        sid: options.sessionId
       },
       options
     );
@@ -1043,7 +1553,8 @@ var SDKServer = class {
     return new SignJWT({
       openId: payload.openId,
       appId: payload.appId,
-      name: payload.name
+      name: payload.name,
+      ...payload.sid ? { sid: payload.sid } : {}
     }).setProtectedHeader({ alg: "HS256", typ: "JWT" }).setExpirationTime(expirationSeconds).sign(secretKey);
   }
   async verifySession(cookieValue) {
@@ -1056,7 +1567,7 @@ var SDKServer = class {
       const { payload } = await jwtVerify(cookieValue, secretKey, {
         algorithms: ["HS256"]
       });
-      const { openId, appId, name } = payload;
+      const { openId, appId, name, sid } = payload;
       if (!isNonEmptyString(openId) || !isNonEmptyString(appId) || !isNonEmptyString(name)) {
         console.warn("[Auth] Session payload missing required fields");
         return null;
@@ -1064,7 +1575,8 @@ var SDKServer = class {
       return {
         openId,
         appId,
-        name
+        name,
+        ...isNonEmptyString(sid) ? { sid } : {}
       };
     } catch (error) {
       console.warn("[Auth] Session verification failed", String(error));
@@ -1103,6 +1615,10 @@ var SDKServer = class {
     if (!session) {
       throw ForbiddenError("Invalid session cookie");
     }
+    const trackedSession = session.sid ? await getSession2(session.sid) : null;
+    if (session.sid && !trackedSession) {
+      throw ForbiddenError("This session has expired or was signed out.");
+    }
     if (session.openId.startsWith(CRON_OPEN_ID_PREFIX)) {
       const userInfo = await this.getUserInfoWithJwt(sessionToken ?? "");
       const taskUid = userInfo.taskUid ?? null;
@@ -1114,6 +1630,15 @@ var SDKServer = class {
     const sessionUserId = session.openId;
     const signedInAt = /* @__PURE__ */ new Date();
     let user = await getUserByOpenId2(sessionUserId);
+    if (session.sid) {
+      if (!user || !trackedSession || trackedSession.userId !== user.id) {
+        throw ForbiddenError("Session has been revoked");
+      }
+      const fiveMinutesAgo = Date.now() - 5 * 60 * 1e3;
+      if (trackedSession.lastSeenAt.getTime() < fiveMinutesAgo) {
+        await touchSession2(trackedSession.id, signedInAt);
+      }
+    }
     if (!user) {
       try {
         const userInfo = await this.getUserInfoWithJwt(sessionToken ?? "");
@@ -1133,11 +1658,19 @@ var SDKServer = class {
     if (!user) {
       throw ForbiddenError("User not found");
     }
-    await upsertUser2({
-      openId: user.openId,
-      lastSignedIn: signedInAt
-    });
-    return user;
+    if (user.status === "disabled") {
+      if (session.sid) await revokeSession2(user.id, session.sid);
+      throw ForbiddenError("This account has been disabled.");
+    }
+    const lastSignedInAt = user.lastSignedIn?.getTime() ?? 0;
+    if (Date.now() - lastSignedInAt > 60 * 60 * 1e3) {
+      await upsertUser2({
+        openId: user.openId,
+        lastSignedIn: signedInAt
+      });
+      user = { ...user, lastSignedIn: signedInAt };
+    }
+    return session.sid ? { ...user, sessionId: session.sid } : user;
   }
 };
 var CRON_OPEN_ID_PREFIX = "cron_";
@@ -1148,8 +1681,10 @@ function buildCronUser(userInfo) {
     openId: userInfo.openId,
     name: userInfo.name || "Manus Scheduled Task",
     email: null,
+    passwordHash: null,
     loginMethod: null,
     role: "user",
+    status: "active",
     createdAt: now,
     updatedAt: now,
     lastSignedIn: now,
@@ -1159,15 +1694,276 @@ function buildCronUser(userInfo) {
 }
 var sdk = new SDKServer();
 
+// server/authService.ts
+var SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1e3;
+var MAX_NAME_LENGTH = 80;
+var MAX_EMAIL_LENGTH = 320;
+var EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+var AuthError = class extends Error {
+  constructor(message, code = "BAD_REQUEST") {
+    super(message);
+    this.code = code;
+    this.name = "AuthError";
+  }
+};
+var ATTEMPT_WINDOW_MS = 15 * 60 * 1e3;
+var MAX_AUTH_ATTEMPTS = 12;
+var authAttempts = /* @__PURE__ */ new Map();
+function assertAuthAttemptAllowed(key) {
+  const now = Date.now();
+  const entry = authAttempts.get(key);
+  if (!entry || entry.resetAt <= now) {
+    authAttempts.delete(key);
+    return;
+  }
+  if (entry.count >= MAX_AUTH_ATTEMPTS) {
+    const minutes = Math.max(1, Math.ceil((entry.resetAt - now) / 6e4));
+    throw new AuthError(
+      `Too many sign-in attempts. Try again in ${minutes} minute${minutes === 1 ? "" : "s"}.`,
+      "RATE_LIMIT"
+    );
+  }
+}
+function recordAuthFailure(key) {
+  const now = Date.now();
+  const entry = authAttempts.get(key);
+  if (!entry || entry.resetAt <= now) {
+    authAttempts.set(key, { count: 1, resetAt: now + ATTEMPT_WINDOW_MS });
+    return;
+  }
+  entry.count += 1;
+  if (authAttempts.size > 5e3) {
+    Array.from(authAttempts.entries()).forEach(([storedKey, value]) => {
+      if (value.resetAt <= now) authAttempts.delete(storedKey);
+    });
+  }
+}
+function clearAuthFailures(key) {
+  authAttempts.delete(key);
+}
+function publicUser(user) {
+  return {
+    id: user.id,
+    openId: user.openId,
+    name: user.name,
+    email: user.email,
+    loginMethod: user.loginMethod,
+    role: user.role,
+    status: user.status,
+    createdAt: user.createdAt,
+    lastSignedIn: user.lastSignedIn,
+    hasPassword: Boolean(user.passwordHash)
+  };
+}
+function normalizeEmail(email) {
+  return email.trim().toLowerCase();
+}
+function assertValidName(name) {
+  const trimmed = name.trim();
+  if (trimmed.length < 2) {
+    throw new AuthError("Enter your name (at least 2 characters).");
+  }
+  if (trimmed.length > MAX_NAME_LENGTH) {
+    throw new AuthError(`Keep your name under ${MAX_NAME_LENGTH} characters.`);
+  }
+  return trimmed;
+}
+function assertValidEmail(email) {
+  const normalized = normalizeEmail(email);
+  if (!normalized || normalized.length > MAX_EMAIL_LENGTH) {
+    throw new AuthError("Enter a valid email address.");
+  }
+  if (!EMAIL_PATTERN.test(normalized)) {
+    throw new AuthError("Enter a valid email address.");
+  }
+  return normalized;
+}
+function getClientIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  const raw = Array.isArray(forwarded) ? forwarded[0] : forwarded?.split(",")[0];
+  const value = (raw || req.socket?.remoteAddress || "").trim();
+  return value.replace(/^::ffff:/, "").slice(0, 64) || null;
+}
+function describeUserAgent(userAgent) {
+  if (!userAgent) return "Unknown device";
+  const browser = /Edg\//i.test(userAgent) ? "Edge" : /OPR\//i.test(userAgent) ? "Opera" : /Chrome\//i.test(userAgent) ? "Chrome" : /Firefox\//i.test(userAgent) ? "Firefox" : /Safari\//i.test(userAgent) ? "Safari" : null;
+  const platform = /Windows NT/i.test(userAgent) ? "Windows" : /iPhone|iPad|iPod/i.test(userAgent) ? "iOS" : /Android/i.test(userAgent) ? "Android" : /Mac OS X/i.test(userAgent) ? "macOS" : /Linux/i.test(userAgent) ? "Linux" : null;
+  if (browser && platform) return `${browser} on ${platform}`;
+  return browser || platform || "Unknown device";
+}
+async function registerLocalUser(input) {
+  const name = assertValidName(input.name);
+  const email = assertValidEmail(input.email);
+  const passwordError = validatePassword(input.password);
+  if (passwordError) throw new AuthError(passwordError);
+  const existing = await getUserByEmail2(email);
+  if (existing) {
+    throw new AuthError(
+      "An account with that email already exists. Sign in instead.",
+      "CONFLICT"
+    );
+  }
+  const passwordHash = await hashPassword(input.password);
+  const openId = `local-${nanoid3(16)}`;
+  const isFirstAccount = await countPasswordAccounts2() === 0;
+  await upsertUser2({
+    openId,
+    name,
+    email,
+    passwordHash,
+    loginMethod: "password",
+    role: isFirstAccount ? "admin" : "user",
+    status: "active",
+    lastSignedIn: /* @__PURE__ */ new Date()
+  });
+  const user = await getUserByOpenId2(openId);
+  if (!user) throw new AuthError("Could not create your account. Try again.");
+  return user;
+}
+async function authenticateLocalUser(email, password) {
+  const user = await getUserByEmail2(normalizeEmail(email));
+  const valid = await verifyPasswordOrDummy(password, user?.passwordHash);
+  if (!user || !valid) return null;
+  if (user.status === "disabled") {
+    throw new AuthError(
+      "This account has been disabled. Contact an administrator.",
+      "FORBIDDEN"
+    );
+  }
+  await upsertUser2({ openId: user.openId, lastSignedIn: /* @__PURE__ */ new Date() });
+  return await getUserByOpenId2(user.openId) ?? user;
+}
+async function issueSession(req, res, user, durationMs = SESSION_DURATION_MS) {
+  const now = /* @__PURE__ */ new Date();
+  const sessionId = nanoid3(32);
+  const userAgent = req.headers["user-agent"]?.slice(0, 1e3) ?? null;
+  await createSession2({
+    id: sessionId,
+    userId: user.id,
+    userAgent,
+    ipAddress: getClientIp(req),
+    createdAt: now,
+    lastSeenAt: now,
+    expiresAt: new Date(now.getTime() + durationMs)
+  });
+  const sessionToken = await sdk.createSessionToken(user.openId, {
+    name: user.name || "Learner",
+    sessionId,
+    expiresInMs: durationMs
+  });
+  res.cookie(COOKIE_NAME, sessionToken, {
+    ...getSessionCookieOptions(req),
+    maxAge: durationMs
+  });
+  return sessionId;
+}
+function clearSessionCookie(req, res) {
+  res.clearCookie(COOKIE_NAME, {
+    ...getSessionCookieOptions(req),
+    maxAge: -1
+  });
+}
+async function destroySession(req, res, userId, sessionId) {
+  if (sessionId) await revokeSession2(userId, sessionId);
+  clearSessionCookie(req, res);
+}
+async function listUserSessions(userId, currentSessionId) {
+  const sessions = await listSessions2(userId);
+  return sessions.map((session) => ({
+    id: session.id,
+    device: describeUserAgent(session.userAgent),
+    ipAddress: session.ipAddress,
+    createdAt: session.createdAt,
+    lastSeenAt: session.lastSeenAt,
+    expiresAt: session.expiresAt,
+    current: session.id === currentSessionId
+  })).sort((a, b) => Number(b.current) - Number(a.current));
+}
+async function updateAccount(user, input) {
+  const name = assertValidName(input.name);
+  const email = assertValidEmail(input.email);
+  try {
+    const updated = await updateUserAccount2(user.id, { name, email });
+    if (!updated) throw new AuthError("Could not update your account.");
+    return updated;
+  } catch (error) {
+    if (error instanceof AuthError) throw error;
+    if (error instanceof Error && /already in use/i.test(error.message)) {
+      throw new AuthError(error.message, "CONFLICT");
+    }
+    throw error;
+  }
+}
+async function changePassword(user, currentPassword, newPassword) {
+  const passwordError = validatePassword(newPassword);
+  if (passwordError) throw new AuthError(passwordError);
+  if (user.passwordHash) {
+    if (!currentPassword) {
+      throw new AuthError("Enter your current password.");
+    }
+    const valid = await verifyPassword(currentPassword, user.passwordHash);
+    if (!valid) {
+      throw new AuthError("Your current password is incorrect.", "UNAUTHORIZED");
+    }
+  }
+  const passwordHash = await hashPassword(newPassword);
+  await updateUserPassword2(user.id, passwordHash);
+  return true;
+}
+async function deleteAccount(user, input) {
+  if (input.confirmation !== "DELETE") {
+    throw new AuthError("Type DELETE to confirm account deletion.");
+  }
+  if (user.role === "admin" && user.status === "active") {
+    const activeAdmins = await countActiveAdmins2();
+    if (activeAdmins <= 1) {
+      throw new AuthError(
+        "You are the only active administrator. Promote another admin before deleting this account."
+      );
+    }
+  }
+  if (user.passwordHash) {
+    if (!input.password) {
+      throw new AuthError("Enter your password to delete your account.");
+    }
+    const valid = await verifyPassword(input.password, user.passwordHash);
+    if (!valid) {
+      throw new AuthError("Your password is incorrect.", "UNAUTHORIZED");
+    }
+  }
+  await deleteUserAccount2(user.id);
+  return true;
+}
+
 // server/_core/localAuth.ts
 var LOCAL_DEMO_OPEN_ID = "local-demo-user";
 function isLocalAuthEnabled() {
   return ENV.localAuthEnabled;
 }
+function isPasswordAuthEnabled() {
+  return isLocalAuthEnabled() && process.env.PASSWORD_AUTH !== "false";
+}
 function safeReturnTo(value) {
   if (typeof value !== "string") return "/";
   if (!value.startsWith("/") || value.startsWith("//")) return "/";
+  if (value.startsWith("/login")) return "/";
   return value;
+}
+async function ensureDemoUser() {
+  let user = await getUserByOpenId2(LOCAL_DEMO_OPEN_ID);
+  if (!user) {
+    await upsertUser2({
+      openId: LOCAL_DEMO_OPEN_ID,
+      name: "Alex Morgan",
+      email: "alex.morgan@example.com",
+      loginMethod: "local",
+      role: "user",
+      status: "active",
+      lastSignedIn: /* @__PURE__ */ new Date()
+    });
+    user = await getUserByOpenId2(LOCAL_DEMO_OPEN_ID);
+  }
+  return user;
 }
 function registerLocalAuthRoutes(app) {
   app.get("/api/auth/local", async (req, res) => {
@@ -1178,22 +1974,9 @@ function registerLocalAuthRoutes(app) {
       return;
     }
     try {
-      await upsertUser2({
-        openId: LOCAL_DEMO_OPEN_ID,
-        name: "Alex Morgan",
-        email: "alex.morgan@example.com",
-        loginMethod: "local",
-        lastSignedIn: /* @__PURE__ */ new Date()
-      });
-      const user = await getUserByOpenId2(LOCAL_DEMO_OPEN_ID);
-      const sessionToken = await sdk.createSessionToken(LOCAL_DEMO_OPEN_ID, {
-        name: user?.name || "Alex Morgan",
-        expiresInMs: ONE_YEAR_MS
-      });
-      res.cookie(COOKIE_NAME, sessionToken, {
-        ...getSessionCookieOptions(req),
-        maxAge: ONE_YEAR_MS
-      });
+      const user = await ensureDemoUser();
+      if (!user) throw new Error("Demo user could not be created");
+      await issueSession(req, res, user);
       res.redirect(302, safeReturnTo(req.query.returnTo));
     } catch (error) {
       console.error("[LocalAuth] Sign-in failed", error);
@@ -1211,12 +1994,12 @@ function getQueryParam(req, key) {
 function registerOAuthRoutes(app) {
   app.get("/api/oauth/callback", async (req, res) => {
     const code = getQueryParam(req, "code");
-    const state2 = getQueryParam(req, "state");
-    if (!code || !state2) {
+    const state = getQueryParam(req, "state");
+    if (!code || !state) {
       res.status(400).json({ error: "code and state are required" });
       return;
     }
-    const { nonce } = decodeOAuthState(state2);
+    const { nonce } = decodeOAuthState(state);
     const expectedNonce = parseCookieHeader2(req.headers.cookie ?? "")[OAUTH_STATE_COOKIE];
     if (!nonce || nonce !== expectedNonce) {
       res.status(403).json({ error: "invalid oauth state" });
@@ -1224,7 +2007,7 @@ function registerOAuthRoutes(app) {
     }
     res.clearCookie(OAUTH_STATE_COOKIE, { path: "/", secure: true, sameSite: "none" });
     try {
-      const tokenResponse = await sdk.exchangeCodeForToken(code, state2);
+      const tokenResponse = await sdk.exchangeCodeForToken(code, state);
       const userInfo = await sdk.getUserInfo(tokenResponse.accessToken);
       if (!userInfo.openId) {
         res.status(400).json({ error: "openId missing from user info" });
@@ -2058,6 +2841,74 @@ var systemRouter = router({
   })
 });
 
+// server/adminService.ts
+var DEMO_OPEN_ID = "local-demo-user";
+async function listAdminUsers() {
+  const users2 = await listAllUsers2();
+  const sessionCounts = await Promise.all(
+    users2.map((user) => countActiveSessions2(user.id))
+  );
+  return users2.map((user, index2) => ({
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    status: user.status,
+    loginMethod: user.loginMethod,
+    createdAt: user.createdAt,
+    lastSignedIn: user.lastSignedIn,
+    activeSessions: sessionCounts[index2] ?? 0,
+    hasPassword: Boolean(user.passwordHash),
+    isDemo: user.openId === DEMO_OPEN_ID
+  }));
+}
+async function updateUserModeration3(actor, input) {
+  const target = await getUserById2(input.userId);
+  if (!target) throw new AuthError("That user no longer exists.");
+  if (target.id === actor.id) {
+    const changesSelf = input.role !== void 0 && input.role !== target.role || input.status !== void 0 && input.status !== target.status;
+    if (changesSelf) {
+      throw new AuthError(
+        "You cannot change your own role or account status."
+      );
+    }
+    return target;
+  }
+  if (target.openId === DEMO_OPEN_ID) {
+    throw new AuthError("The demo account cannot be moderated.");
+  }
+  const removesActiveAdmin = target.role === "admin" && target.status === "active" && (input.role === "user" || input.status === "disabled");
+  if (removesActiveAdmin) {
+    const activeAdmins = await countActiveAdmins2();
+    if (activeAdmins <= 1) {
+      throw new AuthError("At least one active administrator is required.");
+    }
+  }
+  const updated = await updateUserModeration2(target.id, {
+    role: input.role,
+    status: input.status
+  });
+  if (!updated) throw new AuthError("Could not update that user.");
+  if (input.status === "disabled") {
+    await revokeAllSessions2(target.id);
+  }
+  return updated;
+}
+async function revokeUserSessions(actor, userId) {
+  if (actor.id === userId) {
+    throw new AuthError(
+      "Manage your own sessions from Settings instead."
+    );
+  }
+  const target = await getUserById2(userId);
+  if (!target) throw new AuthError("That user no longer exists.");
+  if (target.openId === DEMO_OPEN_ID) {
+    throw new AuthError("The demo account cannot be moderated.");
+  }
+  await revokeAllSessions2(userId);
+  return { success: true };
+}
+
 // server/storage.ts
 import fs3 from "node:fs";
 import path3 from "node:path";
@@ -2148,6 +2999,29 @@ async function storageGetSignedUrl(relKey) {
 var tutorModeSchema = z2.enum(TUTOR_MODES);
 var practiceTypeSchema = z2.enum(["vocabulary", "grammar", "rewrite", "writing"]);
 var cleanText = z2.string().trim().min(1).max(1800);
+var emailSchema = z2.string().trim().email().max(320);
+function authError(error) {
+  if (error instanceof AuthError) {
+    const code = error.code === "CONFLICT" ? "CONFLICT" : error.code === "UNAUTHORIZED" ? "UNAUTHORIZED" : error.code === "FORBIDDEN" ? "FORBIDDEN" : error.code === "RATE_LIMIT" ? "TOO_MANY_REQUESTS" : "BAD_REQUEST";
+    return new TRPCError3({ code, message: error.message });
+  }
+  console.error("[Auth]", error);
+  return new TRPCError3({
+    code: "INTERNAL_SERVER_ERROR",
+    message: "Something went wrong while signing you in. Please try again."
+  });
+}
+function requirePasswordAuth() {
+  if (!isPasswordAuthEnabled()) {
+    throw new TRPCError3({
+      code: "FORBIDDEN",
+      message: "Email and password sign-in is not enabled on this deployment. Use the configured sign-in method."
+    });
+  }
+}
+function attemptKey(req, scope) {
+  return `${scope}:${getClientIp(req) ?? "unknown"}`;
+}
 function assistantText(response) {
   const content = response.choices[0]?.message.content;
   if (typeof content !== "string" || !content.trim()) throw new Error("The tutor returned an empty response");
@@ -2161,10 +3035,123 @@ function aiError(error) {
 var appRouter = router({
   system: systemRouter,
   auth: router({
-    me: publicProcedure.query((opts) => opts.ctx.user),
-    logout: publicProcedure.mutation(({ ctx }) => {
-      ctx.res.clearCookie(COOKIE_NAME, { ...getSessionCookieOptions(ctx.req), maxAge: -1 });
+    me: publicProcedure.query((opts) => opts.ctx.user ? publicUser(opts.ctx.user) : null),
+    methods: publicProcedure.query(() => ({
+      password: isPasswordAuthEnabled(),
+      demo: isLocalAuthEnabled()
+    })),
+    register: publicProcedure.input(
+      z2.object({
+        name: z2.string().trim().min(2).max(80),
+        email: emailSchema,
+        password: z2.string().min(8).max(128)
+      })
+    ).mutation(async ({ ctx, input }) => {
+      requirePasswordAuth();
+      const key = attemptKey(ctx.req, "register");
+      try {
+        assertAuthAttemptAllowed(key);
+        const user = await registerLocalUser(input);
+        await issueSession(ctx.req, ctx.res, user);
+        clearAuthFailures(key);
+        return publicUser(user);
+      } catch (error) {
+        recordAuthFailure(key);
+        throw authError(error);
+      }
+    }),
+    login: publicProcedure.input(z2.object({ email: emailSchema, password: z2.string().min(1).max(128) })).mutation(async ({ ctx, input }) => {
+      requirePasswordAuth();
+      const key = attemptKey(ctx.req, "login");
+      try {
+        assertAuthAttemptAllowed(key);
+        const user = await authenticateLocalUser(input.email, input.password);
+        if (!user) {
+          recordAuthFailure(key);
+          throw new AuthError("The email or password is incorrect.", "UNAUTHORIZED");
+        }
+        await issueSession(ctx.req, ctx.res, user);
+        clearAuthFailures(key);
+        return publicUser(user);
+      } catch (error) {
+        throw authError(error);
+      }
+    }),
+    logout: publicProcedure.mutation(async ({ ctx }) => {
+      if (ctx.user?.id && ctx.sessionId) {
+        await destroySession(ctx.req, ctx.res, ctx.user.id, ctx.sessionId);
+      } else {
+        clearSessionCookie(ctx.req, ctx.res);
+      }
       return { success: true };
+    }),
+    sessions: protectedProcedure.query(({ ctx }) => listUserSessions(ctx.user.id, ctx.sessionId)),
+    revokeSession: protectedProcedure.input(z2.object({ sessionId: z2.string().min(8).max(64) })).mutation(async ({ ctx, input }) => {
+      if (input.sessionId === ctx.sessionId) {
+        await destroySession(ctx.req, ctx.res, ctx.user.id, input.sessionId);
+        return { success: true, signedOut: true };
+      }
+      await revokeSession2(ctx.user.id, input.sessionId);
+      return { success: true, signedOut: false };
+    }),
+    revokeOtherSessions: protectedProcedure.mutation(async ({ ctx }) => {
+      await revokeOtherSessions2(ctx.user.id, ctx.sessionId);
+      return { success: true };
+    }),
+    updateAccount: protectedProcedure.input(z2.object({ name: z2.string().trim().min(2).max(80), email: emailSchema })).mutation(async ({ ctx, input }) => {
+      try {
+        const user = await updateAccount(ctx.user, input);
+        return publicUser(user);
+      } catch (error) {
+        throw authError(error);
+      }
+    }),
+    changePassword: protectedProcedure.input(
+      z2.object({
+        currentPassword: z2.string().max(128).optional(),
+        newPassword: z2.string().min(8).max(128)
+      })
+    ).mutation(async ({ ctx, input }) => {
+      try {
+        await changePassword(ctx.user, input.currentPassword, input.newPassword);
+        await revokeOtherSessions2(ctx.user.id, ctx.sessionId);
+        return { success: true };
+      } catch (error) {
+        throw authError(error);
+      }
+    }),
+    deleteAccount: protectedProcedure.input(z2.object({ password: z2.string().max(128).optional(), confirmation: z2.string() })).mutation(async ({ ctx, input }) => {
+      try {
+        await deleteAccount(ctx.user, input);
+        clearSessionCookie(ctx.req, ctx.res);
+        return { success: true };
+      } catch (error) {
+        throw authError(error);
+      }
+    })
+  }),
+  admin: router({
+    listUsers: adminProcedure.query(() => listAdminUsers()),
+    updateUser: adminProcedure.input(
+      z2.object({
+        userId: z2.number().int().positive(),
+        role: z2.enum(["user", "admin"]).optional(),
+        status: z2.enum(["active", "disabled"]).optional()
+      })
+    ).mutation(async ({ ctx, input }) => {
+      try {
+        const user = await updateUserModeration3(ctx.user, input);
+        return publicUser(user);
+      } catch (error) {
+        throw authError(error);
+      }
+    }),
+    revokeUserSessions: adminProcedure.input(z2.object({ userId: z2.number().int().positive() })).mutation(async ({ ctx, input }) => {
+      try {
+        return await revokeUserSessions(ctx.user, input.userId);
+      } catch (error) {
+        throw authError(error);
+      }
     })
   }),
   profile: router({
@@ -2329,15 +3316,21 @@ Write your first answer when you are ready.`);
 // server/_core/context.ts
 async function createContext(opts) {
   let user = null;
+  let sessionId;
   try {
-    user = await sdk.authenticateRequest(opts.req);
+    const authenticated = await sdk.authenticateRequest(
+      opts.req
+    );
+    user = authenticated;
+    sessionId = authenticated.sessionId;
   } catch (error) {
     user = null;
   }
   return {
     req: opts.req,
     res: opts.res,
-    user
+    user,
+    sessionId
   };
 }
 
@@ -2349,7 +3342,9 @@ function createApp() {
   app.get("/api/health", (_req, res) => {
     res.json({
       status: "ok",
-      auth: isLocalAuthEnabled() ? "local" : "oauth",
+      auth: isPasswordAuthEnabled() ? "email-password" : "disabled",
+      demoAuth: isLocalAuthEnabled(),
+      storage: getStorageMode(),
       time: (/* @__PURE__ */ new Date()).toISOString()
     });
   });

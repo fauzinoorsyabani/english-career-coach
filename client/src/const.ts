@@ -14,8 +14,10 @@ export const isLocalAuthEnabled =
   import.meta.env.VITE_LOCAL_AUTH === "true" ||
   (import.meta.env.DEV && (!oauthPortalUrl || !appId));
 
+export const isOAuthEnabled = Boolean(oauthPortalUrl && appId);
+
 // Start the Manus OAuth login. Call this from an event handler or effect at the
-// moment you want to navigate, e.g. `onClick={() => startLogin()}`.
+// moment you want to navigate, e.g. `onClick={() => startOAuthLogin()}`.
 //
 // It has SIDE EFFECTS — it mints a one-time nonce, writes the __Host- state
 // cookie, and navigates immediately — so the cookie nonce always matches the
@@ -24,13 +26,10 @@ export const isLocalAuthEnabled =
 // call would desync it from an in-flight login and the callback would reject it
 // with "invalid oauth state". It returns void by design, so there is no URL to
 // stash across renders.
-export const startLogin = () => {
-  const returnTo = `${window.location.pathname}${window.location.search}`;
-
-  if (isLocalAuthEnabled) {
-    window.location.href = `/api/auth/local?returnTo=${encodeURIComponent(returnTo)}`;
-    return;
-  }
+export const startOAuthLogin = (returnToOverride?: string) => {
+  const returnTo =
+    returnToOverride ??
+    `${window.location.pathname}${window.location.search}`;
 
   const redirectUri = `${window.location.origin}/api/oauth/callback`;
   const nonce = crypto.randomUUID();
@@ -44,5 +43,25 @@ export const startLogin = () => {
   url.searchParams.set("state", state);
   url.searchParams.set("type", "signIn");
 
+  // Keep the destination for after the OAuth callback.
+  try {
+    sessionStorage.setItem("oauth-return-to", returnTo);
+  } catch {}
+
   window.location.href = url.toString();
+};
+
+export const startLogin = () => {
+  const returnTo =
+    typeof window === "undefined"
+      ? "/"
+      : window.location.pathname.startsWith("/login")
+        ? "/"
+        : `${window.location.pathname}${window.location.search}`;
+
+  window.location.href = `/login?returnTo=${encodeURIComponent(returnTo)}`;
+};
+
+export const startDemoLogin = (returnTo = "/") => {
+  window.location.href = `/api/auth/local?returnTo=${encodeURIComponent(returnTo)}`;
 };

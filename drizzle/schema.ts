@@ -15,12 +15,31 @@ export const users = mysqlTable("users", {
   openId: varchar("openId", { length: 64 }).notNull().unique(),
   name: text("name"),
   email: varchar("email", { length: 320 }),
+  passwordHash: varchar("passwordHash", { length: 255 }),
   loginMethod: varchar("loginMethod", { length: 64 }),
   role: mysqlEnum("role", ["user", "admin"]).default("user").notNull(),
+  status: mysqlEnum("status", ["active", "disabled"]).default("active").notNull(),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
   lastSignedIn: timestamp("lastSignedIn").defaultNow().notNull(),
 });
+
+export const userSessions = mysqlTable(
+  "user_sessions",
+  {
+    id: varchar("id", { length: 64 }).primaryKey(),
+    userId: int("userId").notNull(),
+    userAgent: text("userAgent"),
+    ipAddress: varchar("ipAddress", { length: 64 }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    lastSeenAt: timestamp("lastSeenAt").defaultNow().notNull(),
+    expiresAt: timestamp("expiresAt").notNull(),
+  },
+  table => ({
+    userSeen: index("session_user_seen_idx").on(table.userId, table.lastSeenAt),
+    expires: index("session_expires_idx").on(table.expiresAt),
+  })
+);
 
 export const learnerProfiles = mysqlTable(
   "learner_profiles",
@@ -130,6 +149,7 @@ export const dailyChallengeCompletions = mysqlTable(
 
 export type User = typeof users.$inferSelect;
 export type InsertUser = typeof users.$inferInsert;
+export type UserSession = typeof userSessions.$inferSelect;
 export type LearnerProfile = typeof learnerProfiles.$inferSelect;
 export type TutorConversation = typeof tutorConversations.$inferSelect;
 export type TutorMessage = typeof tutorMessages.$inferSelect;

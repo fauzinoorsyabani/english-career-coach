@@ -5,26 +5,24 @@ import { httpBatchLink, TRPCClientError } from "@trpc/client";
 import { createRoot } from "react-dom/client";
 import superjson from "superjson";
 import App from "./App";
-import { startLogin } from "./const";
 import "./index.css";
 
 const queryClient = new QueryClient();
 
-const redirectToLoginIfUnauthorized = (error: unknown) => {
+// Protected pages are only rendered for a signed-in learner, so an occasional
+// UNAUTHORIZED response (for example, a session revoked on another device)
+// should simply refresh the session state instead of forcing a redirect.
+const refreshSessionIfUnauthorized = (error: unknown) => {
   if (!(error instanceof TRPCClientError)) return;
   if (typeof window === "undefined") return;
-
-  const isUnauthorized = error.message === UNAUTHED_ERR_MSG;
-
-  if (!isUnauthorized) return;
-
-  startLogin();
+  if (error.message !== UNAUTHED_ERR_MSG) return;
+  void queryClient.invalidateQueries();
 };
 
 queryClient.getQueryCache().subscribe(event => {
   if (event.type === "updated" && event.action.type === "error") {
     const error = event.query.state.error;
-    redirectToLoginIfUnauthorized(error);
+    refreshSessionIfUnauthorized(error);
     console.error("[API Query Error]", error);
   }
 });
@@ -32,7 +30,7 @@ queryClient.getQueryCache().subscribe(event => {
 queryClient.getMutationCache().subscribe(event => {
   if (event.type === "updated" && event.action.type === "error") {
     const error = event.mutation.state.error;
-    redirectToLoginIfUnauthorized(error);
+    refreshSessionIfUnauthorized(error);
     console.error("[API Mutation Error]", error);
   }
 });

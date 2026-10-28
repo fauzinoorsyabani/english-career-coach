@@ -1,11 +1,28 @@
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
-import { COOKIE_NAME } from "@shared/const";
-import { getSessionCookieOptions } from "./_core/cookies";
 import { invokeLLM } from "./_core/llm";
+import { isLocalAuthEnabled, isPasswordAuthEnabled } from "./_core/localAuth";
 import { transcribeAudio } from "./_core/voiceTranscription";
 import { systemRouter } from "./_core/systemRouter";
-import { protectedProcedure, publicProcedure, router } from "./_core/trpc";
+import { adminProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc";
+import { listAdminUsers, revokeUserSessions, updateUserModeration } from "./adminService";
+import {
+  assertAuthAttemptAllowed,
+  authenticateLocalUser,
+  AuthError,
+  changePassword,
+  clearAuthFailures,
+  clearSessionCookie,
+  deleteAccount,
+  destroySession,
+  getClientIp,
+  issueSession,
+  listUserSessions,
+  publicUser,
+  recordAuthFailure,
+  registerLocalUser,
+  updateAccount,
+} from "./authService";
 import * as db from "./db";
 import { careerScenarios, challengeDateKey, getDailyChallenge, isSupportedAudioMime, parsePracticeFeedback, PracticeType, supportedAudioMimes, TUTOR_MODES, tutorModeLabels, tutorSystemPrompt } from "./learning";
 import { storageGetSignedUrl, storagePut } from "./storage";
@@ -13,6 +30,42 @@ import { storageGetSignedUrl, storagePut } from "./storage";
 const tutorModeSchema = z.enum(TUTOR_MODES);
 const practiceTypeSchema = z.enum(["vocabulary", "grammar", "rewrite", "writing"] satisfies [PracticeType, ...PracticeType[]]);
 const cleanText = z.string().trim().min(1).max(1800);
+const emailSchema = z.string().trim().email().max(320);
+
+function authError(error: unknown) {
+  if (error instanceof AuthError) {
+    const code =
+      error.code === "CONFLICT"
+        ? "CONFLICT"
+        : error.code === "UNAUTHORIZED"
+          ? "UNAUTHORIZED"
+          : error.code === "FORBIDDEN"
+            ? "FORBIDDEN"
+            : error.code === "RATE_LIMIT"
+              ? "TOO_MANY_REQUESTS"
+              : "BAD_REQUEST";
+    return new TRPCError({ code, message: error.message });
+  }
+  console.error("[Auth]", error);
+  return new TRPCError({
+    code: "INTERNAL_SERVER_ERROR",
+    message: "Something went wrong while signing you in. Please try again.",
+  });
+}
+
+function requirePasswordAuth() {
+  if (!isPasswordAuthEnabled()) {
+    throw new TRPCError({
+      code: "FORBIDDEN",
+      message:
+        "Email and password sign-in is not enabled on this deployment. Use the configured sign-in method.",
+    });
+  }
+}
+
+function attemptKey(req: Parameters<typeof getClientIp>[0], scope: string) {
+  return `${scope}:${getClientIp(req) ?? "unknown"}`;
+}
 
 function assistantText(response: Awaited<ReturnType<typeof invokeLLM>>) {
   const content = response.choices[0]?.message.content;
@@ -29,11 +82,140 @@ function aiError(error: unknown) {
 export const appRouter = router({
   system: systemRouter,
   auth: router({
-    me: publicProcedure.query(opts => opts.ctx.user),
-    logout: publicProcedure.mutation(({ ctx }) => {
-      ctx.res.clearCookie(COOKIE_NAME, { ...getSessionCookieOptions(ctx.req), maxAge: -1 });
+    me: publicProcedure.query(opts => (opts.ctx.user ? publicUser(opts.ctx.user) : null)),
+    methods: publicProcedure.query(() => ({
+      password: isPasswordAuthEnabled(),
+      demo: isLocalAuthEnabled(),
+    })),
+    register: publicProcedure
+      .input(
+        z.object({
+          name: z.string().trim().min(2).max(80),
+          email: emailSchema,
+          password: z.string().min(8).max(128),
+        })
+      )
+      .mutation(async ({ ctx, input }) => {
+        requirePasswordAuth();
+        const key = attemptKey(ctx.req, "register");
+        try {
+          assertAuthAttemptAllowed(key);
+          const user = await registerLocalUser(input);
+          await issueSession(ctx.req, ctx.res, user);
+          clearAuthFailures(key);
+          return publicUser(user);
+        } catch (error) {
+          recordAuthFailure(key);
+          throw authError(error);
+        }
+      }),
+    login: publicProcedure
+      .input(z.object({ email: emailSchema, password: z.string().min(1).max(128) }))
+      .mutation(async ({ ctx, input }) => {
+        requirePasswordAuth();
+        const key = attemptKey(ctx.req, "login");
+        try {
+          assertAuthAttemptAllowed(key);
+          const user = await authenticateLocalUser(input.email, input.password);
+          if (!user) {
+            recordAuthFailure(key);
+            throw new AuthError("The email or password is incorrect.", "UNAUTHORIZED");
+          }
+          await issueSession(ctx.req, ctx.res, user);
+          clearAuthFailures(key);
+          return publicUser(user);
+        } catch (error) {
+          throw authError(error);
+        }
+      }),
+    logout: publicProcedure.mutation(async ({ ctx }) => {
+      if (ctx.user?.id && ctx.sessionId) {
+        await destroySession(ctx.req, ctx.res, ctx.user.id, ctx.sessionId);
+      } else {
+        clearSessionCookie(ctx.req, ctx.res);
+      }
       return { success: true } as const;
     }),
+    sessions: protectedProcedure.query(({ ctx }) => listUserSessions(ctx.user.id, ctx.sessionId)),
+    revokeSession: protectedProcedure
+      .input(z.object({ sessionId: z.string().min(8).max(64) }))
+      .mutation(async ({ ctx, input }) => {
+        if (input.sessionId === ctx.sessionId) {
+          await destroySession(ctx.req, ctx.res, ctx.user.id, input.sessionId);
+          return { success: true, signedOut: true };
+        }
+        await db.revokeSession(ctx.user.id, input.sessionId);
+        return { success: true, signedOut: false };
+      }),
+    revokeOtherSessions: protectedProcedure.mutation(async ({ ctx }) => {
+      await db.revokeOtherSessions(ctx.user.id, ctx.sessionId);
+      return { success: true };
+    }),
+    updateAccount: protectedProcedure
+      .input(z.object({ name: z.string().trim().min(2).max(80), email: emailSchema }))
+      .mutation(async ({ ctx, input }) => {
+        try {
+          const user = await updateAccount(ctx.user, input);
+          return publicUser(user);
+        } catch (error) {
+          throw authError(error);
+        }
+      }),
+    changePassword: protectedProcedure
+      .input(
+        z.object({
+          currentPassword: z.string().max(128).optional(),
+          newPassword: z.string().min(8).max(128),
+        })
+      )
+      .mutation(async ({ ctx, input }) => {
+        try {
+          await changePassword(ctx.user, input.currentPassword, input.newPassword);
+          await db.revokeOtherSessions(ctx.user.id, ctx.sessionId);
+          return { success: true };
+        } catch (error) {
+          throw authError(error);
+        }
+      }),
+    deleteAccount: protectedProcedure
+      .input(z.object({ password: z.string().max(128).optional(), confirmation: z.string() }))
+      .mutation(async ({ ctx, input }) => {
+        try {
+          await deleteAccount(ctx.user, input);
+          clearSessionCookie(ctx.req, ctx.res);
+          return { success: true };
+        } catch (error) {
+          throw authError(error);
+        }
+      }),
+  }),
+  admin: router({
+    listUsers: adminProcedure.query(() => listAdminUsers()),
+    updateUser: adminProcedure
+      .input(
+        z.object({
+          userId: z.number().int().positive(),
+          role: z.enum(["user", "admin"]).optional(),
+          status: z.enum(["active", "disabled"]).optional(),
+        })
+      )
+      .mutation(async ({ ctx, input }) => {
+        try {
+          const user = await updateUserModeration(ctx.user, input);
+          return publicUser(user);
+        } catch (error) {
+          throw authError(error);
+        }
+      }),
+    revokeUserSessions: adminProcedure
+      .input(z.object({ userId: z.number().int().positive() }))
+      .mutation(async ({ ctx, input }) => {
+        try {
+          return await revokeUserSessions(ctx.user, input.userId);
+        } catch (error) {
+          throw authError(error);
+        }
+      }),
   }),
   profile: router({
     get: protectedProcedure.query(({ ctx }) => db.getProfile(ctx.user.id)),

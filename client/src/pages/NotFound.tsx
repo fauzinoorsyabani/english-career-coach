@@ -1,52 +1,40 @@
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
-import { AlertCircle, Home } from "lucide-react";
+import { ArrowLeft } from "lucide-react";
 import { useLocation } from "wouter";
 
 export default function NotFound() {
   const [, setLocation] = useLocation();
 
-  const handleGoHome = () => {
-    setLocation("/");
-  };
-
   return (
-    <div className="min-h-screen w-full flex items-center justify-center bg-gradient-to-br from-slate-50 to-slate-100">
-      <Card className="w-full max-w-lg mx-4 shadow-lg border-0 bg-white/80 backdrop-blur-sm">
-        <CardContent className="pt-8 pb-8 text-center">
-          <div className="flex justify-center mb-6">
-            <div className="relative">
-              <div className="absolute inset-0 bg-red-100 rounded-full animate-pulse" />
-              <AlertCircle className="relative h-16 w-16 text-red-500" />
-            </div>
-          </div>
-
-          <h1 className="text-4xl font-bold text-slate-900 mb-2">404</h1>
-
-          <h2 className="text-xl font-semibold text-slate-700 mb-4">
-            Page Not Found
-          </h2>
-
-          <p className="text-slate-600 mb-8 leading-relaxed">
-            Sorry, the page you are looking for doesn't exist.
-            <br />
-            It may have been moved or deleted.
+    <main className="flex min-h-screen items-center justify-center bg-background px-4 py-10">
+      <section className="study-card grid w-full max-w-3xl overflow-hidden sm:grid-cols-[1.15fr_0.85fr]">
+        <div className="p-7 sm:p-10">
+          <p className="eyebrow text-accent-ink">Error / 404</p>
+          <h1 className="editorial-title mt-3 text-4xl sm:text-5xl">
+            This page left the <span className="mark">syllabus</span>.
+          </h1>
+          <p className="mt-4 text-sm leading-7 text-muted-foreground">
+            That page is not part of your study desk. It may have moved, or the link may be
+            incomplete.
           </p>
-
-          <div
-            id="not-found-button-group"
-            className="flex flex-col sm:flex-row gap-3 justify-center"
-          >
-            <Button
-              onClick={handleGoHome}
-              className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2.5 rounded-lg transition-all duration-200 shadow-md hover:shadow-lg"
-            >
-              <Home className="w-4 h-4 mr-2" />
-              Go Home
+          <div className="mt-7 flex flex-col gap-2 sm:flex-row">
+            <Button onClick={() => setLocation("/")} variant="highlight" className="w-full sm:w-auto">
+              <ArrowLeft aria-hidden="true" />
+              Back to your workspace
+            </Button>
+            <Button onClick={() => window.history.back()} variant="ghost" className="w-full sm:w-auto">
+              Go back
             </Button>
           </div>
-        </CardContent>
-      </Card>
-    </div>
+        </div>
+        <div className="ink-panel relative hidden flex-col justify-between p-8 sm:flex" aria-hidden="true">
+          <span className="eyebrow text-primary-foreground/55">Study desk</span>
+          <p className="editorial-title text-8xl text-primary-foreground/15">404</p>
+          <p className="font-mono text-[11px] uppercase tracking-[0.14em] text-primary-foreground/45">
+            Page not found
+          </p>
+        </div>
+      </section>
+    </main>
   );
 }
